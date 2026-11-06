@@ -16,6 +16,10 @@ export const stats: {
   dups: number
   /** Unread links moved to the cursor. */
   moves: number
+  /** Searches of a dep's subscribers. */
+  lookups: number
+  /** Walks that mark the unread links of a run. */
+  sweeps: number
   /** Links created. */
   links: number
   /** Links removed. */
@@ -27,6 +31,8 @@ export const stats: {
   tailRepeats: 0,
   dups: 0,
   moves: 0,
+  lookups: 0,
+  sweeps: 0,
   links: 0,
   unlinks: 0,
 }

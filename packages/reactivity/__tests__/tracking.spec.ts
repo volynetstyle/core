@@ -150,7 +150,7 @@ describe('reactivity/tracking', () => {
       cs.forEach(c => expectGraph(c as any))
     })
 
-    it.fails('should reuse every link when private reads shuffle', () => {
+    it('should reuse every link when private reads shuffle', () => {
       const sources = range(256).map(i => ref(i))
       const orders = range(16).map(k => permutation(256, 1234 + k))
       const tick = ref(0)
@@ -161,7 +161,24 @@ describe('reactivity/tracking', () => {
           c.value
         }),
       ).toEqual({ links: 0, unlinks: 0 })
+      // one walk over the unread links per run at most: linear, not d²
+      expect(stats.sweeps).toBeLessThanOrEqual(64)
       expectGraph(c as any)
+    })
+
+    it('should not mark a run that is not the first subscriber of its deps', () => {
+      const sources = range(32).map(i => ref(i))
+      computed(() => sources.reduce((sum, s) => sum + s.value, 0)).value
+      const tick = ref(0)
+      const orders = range(16).map(k => permutation(32, 55 + k))
+      const c = ordered(sources, orders, tick)
+      c.value
+      resetStats()
+      tick.value = 1
+      c.value
+      // marking would make every later lookup walk the other sub's links
+      expect(stats.lookups).toBeGreaterThan(0)
+      expect(stats.sweeps).toBe(0)
     })
 
     it.fails('should reuse every link when shared reads shuffle', () => {
@@ -191,13 +208,55 @@ describe('reactivity/tracking', () => {
     it('should link a dep once when a nested run reads it between', () => {
       const a = ref(1)
       const inner = computed(() => a.value)
+      resetStats()
       const runner = effect(() => {
         a.value
         inner.value
         a.value
       })
       expect(depsOf(runner.effect)).toEqual([a, inner])
+      // found a few links behind the cursor: no search of the subscribers
+      expect(stats.lookups).toBe(0)
       expectGraph(runner.effect)
     })
+
+    it('should start over a marked run its effect runs again within', () => {
+      const sources = range(16).map(i => ref(i))
+      const tick = ref(0)
+      let reenter = false
+      let pass = 0
+      const runner = effect(() => {
+        tick.value
+        // each run, the nested one included, reads its own order
+        const order = permutation(16, 7 + pass++)
+        for (let k = 0; k < order.length; k++) {
+          sources[order[k]].value
+          if (reenter && k === 8) {
+            reenter = false
+            runner()
+          }
+        }
+      })
+      resetStats()
+      reenter = true
+      tick.value = 1
+      expect(stats.sweeps).toBeGreaterThan(0)
+      expect(new Set(depsOf(runner.effect))).toEqual(
+        new Set([tick, ...sources]),
+      )
+      expectGraph(runner.effect)
+    })
+  })
+
+  it('should link fresh deps without searching for their links', () => {
+    const sources = range(64).map(i => ref(i))
+    resetStats()
+    effect(() => {
+      for (const s of sources) {
+        s.value
+      }
+    })
+    expect(stats.links).toBe(64)
+    expect(stats.lookups).toBe(0)
   })
 })

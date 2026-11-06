@@ -37,6 +37,8 @@ export const enum ReactiveFlags {
   Recursed = 1 << 3,
   Dirty = 1 << 4,
   Pending = 1 << 5,
+  /** The running sub has marked the links it has not read yet `UNREAD`. */
+  Marked = 1 << 6,
 }
 
 /**
@@ -44,6 +46,9 @@ export const enum ReactiveFlags {
  * the cost of a read independent of how many deps its sub has.
  */
 const SCAN_BUDGET = 8
+
+/** `Link.version` of a link its sub's marked run has not read yet. */
+const UNREAD = -1
 
 const notifyBuffer: (Effect | undefined)[] = []
 
@@ -158,10 +163,13 @@ function linkMiss(
 }
 
 /**
- * Looks for the link of a running `sub` to `dep` near the cursor: a few
- * links ahead, where the last run read `dep` later, or a few links behind,
- * where this run has read `dep` already. Returns false if neither scan
- * finds it; the link may still exist farther away.
+ * Looks for the link of a running `sub` to `dep`, moving it to the cursor if
+ * this run has not read it yet. Near the cursor first: a few links ahead,
+ * where the last run read `dep` later, or a few links behind, where this
+ * run has read `dep` already. Then among the first subscribers of `dep`; a
+ * link found there needs the run's unread links marked to tell whether it
+ * was read. Returns false if the link does not exist, or if no bounded
+ * search can find it.
  */
 function findLink(
   dep: ReactiveNode,
@@ -169,25 +177,84 @@ function findLink(
   prevDep: Link | undefined,
   nextDep: Link | undefined,
 ): boolean {
-  let link = nextDep !== undefined ? nextDep.nextDep : undefined
-  let budget = SCAN_BUDGET
-  while (link !== undefined && link.dep !== dep && --budget) {
-    link = link.nextDep
+  let found: Link | undefined | null
+  if (!(sub.flags & ReactiveFlags.Marked)) {
+    let ahead = nextDep !== undefined ? nextDep.nextDep : undefined
+    let budget = SCAN_BUDGET
+    while (ahead !== undefined && ahead.dep !== dep && --budget) {
+      ahead = ahead.nextDep
+    }
+    if (ahead !== undefined && ahead.dep === dep) {
+      moveLink(ahead, sub, prevDep, nextDep!)
+      return true
+    }
+    let behind = prevDep !== undefined ? prevDep.prevDep : undefined
+    budget = SCAN_BUDGET
+    while (behind !== undefined && behind.dep !== dep && --budget) {
+      behind = behind.prevDep
+    }
+    if (behind !== undefined && behind.dep === dep) {
+      if (__TEST__) stats.dups++
+      return true
+    }
+    // both scans reached the ends of the list: there is no link
+    if (ahead === undefined && behind === undefined) {
+      return false
+    }
+    found = findSub(dep, sub)
+    // Found as the first subscriber, later lookups through the deps'
+    // subscribers likely end at once: mark. Found deeper, each would walk
+    // other subs' links.
+    if (found === undefined || found === null || found !== dep.subs) {
+      return false
+    }
+    markUnread(sub, nextDep)
+  } else {
+    found = findSub(dep, sub)
+    if (found === undefined || found === null) {
+      return false
+    }
   }
-  if (link !== undefined && link.dep === dep) {
-    moveLink(link, sub, prevDep, nextDep!)
-    return true
-  }
-  link = prevDep !== undefined ? prevDep.prevDep : undefined
-  budget = SCAN_BUDGET
-  while (link !== undefined && link.dep !== dep && --budget) {
-    link = link.prevDep
-  }
-  if (link !== undefined && link.dep === dep) {
+  if (found.version !== UNREAD) {
     if (__TEST__) stats.dups++
-    return true
+  } else {
+    moveLink(found, sub, prevDep, nextDep!)
   }
-  return false
+  return true
+}
+
+/**
+ * The link of `sub` among the first subscribers of `dep`: undefined if the
+ * list ends first, null if the budget runs out first.
+ */
+function findSub(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+): Link | undefined | null {
+  if (__TEST__) stats.lookups++
+  let budget = SCAN_BUDGET
+  for (let link = dep.subs; link !== undefined; link = link.nextSub) {
+    if (link.sub === sub) {
+      return link
+    }
+    if (!--budget) {
+      return null
+    }
+  }
+  return undefined
+}
+
+/**
+ * Marks the links the run has not read yet, from `nextDep` on, so that a
+ * link found through its dep tells whether this run has read it. Once per
+ * run: later reads keep the marks exact.
+ */
+function markUnread(sub: ReactiveNode, nextDep: Link | undefined): void {
+  if (__TEST__) stats.sweeps++
+  sub.flags |= ReactiveFlags.Marked
+  for (let link = nextDep; link !== undefined; link = link.nextDep) {
+    link.version = UNREAD
+  }
 }
 
 /** Moves an unread link from behind `nextDep` to the cursor. */
@@ -333,7 +400,12 @@ export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   sub.depsTail = undefined
   sub.flags =
     (sub.flags &
-      ~(ReactiveFlags.Recursed | ReactiveFlags.Dirty | ReactiveFlags.Pending)) |
+      ~(
+        ReactiveFlags.Recursed |
+        ReactiveFlags.Dirty |
+        ReactiveFlags.Pending |
+        ReactiveFlags.Marked
+      )) |
     ReactiveFlags.RecursedCheck
   return setActiveSub(sub)
 }
