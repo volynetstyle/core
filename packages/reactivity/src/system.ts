@@ -90,6 +90,20 @@ export function link(dep: ReactiveNode, sub: ReactiveNode): void {
     sub.depsTail = nextDep
     return
   }
+  linkMiss(dep, sub, prevDep, nextDep)
+}
+
+/**
+ * The slow half of `link()`, kept out of line so the fast half stays small:
+ * `dep` is neither the dep read just before nor the next one in the last
+ * run's order.
+ */
+function linkMiss(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): void {
   const prevSub = dep.subsTail
   if (
     prevSub !== undefined &&
