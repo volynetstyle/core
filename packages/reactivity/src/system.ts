@@ -3,6 +3,7 @@
 import type { ComputedRefImpl as Computed } from './computed.js'
 import type { ReactiveEffect as Effect } from './effect.js'
 import type { EffectScope } from './effectScope.js'
+import { stats } from './stats.js'
 import { warn } from './warning.js'
 
 export interface ReactiveNode {
@@ -76,12 +77,15 @@ export function endBatch(): void {
 }
 
 export function link(dep: ReactiveNode, sub: ReactiveNode): void {
+  if (__TEST__) stats.reads++
   const prevDep = sub.depsTail
   if (prevDep !== undefined && prevDep.dep === dep) {
+    if (__TEST__) stats.repeats++
     return
   }
   const nextDep = prevDep !== undefined ? prevDep.nextDep : sub.deps
   if (nextDep !== undefined && nextDep.dep === dep) {
+    if (__TEST__) stats.hits++
     nextDep.version = globalVersion
     sub.depsTail = nextDep
     return
@@ -92,8 +96,10 @@ export function link(dep: ReactiveNode, sub: ReactiveNode): void {
     prevSub.version === globalVersion &&
     prevSub.sub === sub
   ) {
+    if (__TEST__) stats.tailRepeats++
     return
   }
+  if (__TEST__) stats.links++
   const newLink =
     (sub.depsTail =
     dep.subsTail =
@@ -125,6 +131,7 @@ export function unlink(
   link: Link,
   sub: ReactiveNode = link.sub,
 ): Link | undefined {
+  if (__TEST__) stats.unlinks++
   const dep = link.dep
   const prevDep = link.prevDep
   const nextDep = link.nextDep
