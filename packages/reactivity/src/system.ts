@@ -39,6 +39,12 @@ export const enum ReactiveFlags {
   Pending = 1 << 5,
 }
 
+/**
+ * Links a bounded scan visits on each side of the cursor. A constant keeps
+ * the cost of a read independent of how many deps its sub has.
+ */
+const SCAN_BUDGET = 8
+
 const notifyBuffer: (Effect | undefined)[] = []
 
 export let batchDepth = 0
@@ -104,6 +110,16 @@ function linkMiss(
   prevDep: Link | undefined,
   nextDep: Link | undefined,
 ): void {
+  // Only a running sub reconciles its reads with the last run (an effect
+  // scope links the effects it owns without running), and only for a dep
+  // that has subscribers: one without has no link to find.
+  if (
+    sub.flags & ReactiveFlags.RecursedCheck &&
+    dep.subs !== undefined &&
+    findLink(dep, sub, prevDep, nextDep)
+  ) {
+    return
+  }
   const prevSub = dep.subsTail
   if (
     prevSub !== undefined &&
@@ -139,6 +155,65 @@ function linkMiss(
   } else {
     dep.subs = newLink
   }
+}
+
+/**
+ * Looks for the link of a running `sub` to `dep` near the cursor: a few
+ * links ahead, where the last run read `dep` later, or a few links behind,
+ * where this run has read `dep` already. Returns false if neither scan
+ * finds it; the link may still exist farther away.
+ */
+function findLink(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): boolean {
+  let link = nextDep !== undefined ? nextDep.nextDep : undefined
+  let budget = SCAN_BUDGET
+  while (link !== undefined && link.dep !== dep && --budget) {
+    link = link.nextDep
+  }
+  if (link !== undefined && link.dep === dep) {
+    moveLink(link, sub, prevDep, nextDep!)
+    return true
+  }
+  link = prevDep !== undefined ? prevDep.prevDep : undefined
+  budget = SCAN_BUDGET
+  while (link !== undefined && link.dep !== dep && --budget) {
+    link = link.prevDep
+  }
+  if (link !== undefined && link.dep === dep) {
+    if (__TEST__) stats.dups++
+    return true
+  }
+  return false
+}
+
+/** Moves an unread link from behind `nextDep` to the cursor. */
+function moveLink(
+  link: Link,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link,
+): void {
+  if (__TEST__) stats.moves++
+  const before = link.prevDep!
+  const after = link.nextDep
+  before.nextDep = after
+  if (after !== undefined) {
+    after.prevDep = before
+  }
+  link.prevDep = prevDep
+  link.nextDep = nextDep
+  nextDep.prevDep = link
+  if (prevDep !== undefined) {
+    prevDep.nextDep = link
+  } else {
+    sub.deps = link
+  }
+  link.version = globalVersion
+  sub.depsTail = link
 }
 
 export function unlink(

@@ -114,7 +114,7 @@ describe('reactivity/tracking', () => {
   })
 
   describe('reordered reads', () => {
-    it.fails('should reuse every link when the read order rotates', () => {
+    it('should reuse every link when the read order rotates', () => {
       const sources = range(256).map(i => ref(i))
       const orders = range(256).map(r => range(256).map(k => (k + r) & 255))
       const tick = ref(0)
@@ -128,7 +128,7 @@ describe('reactivity/tracking', () => {
       expectGraph(c as any)
     })
 
-    it.fails('should reuse every link when shared reads swap neighbours', () => {
+    it('should reuse every link when shared reads swap neighbours', () => {
       const n = 256
       const sources = range(n).map(i => ref(i))
       const orders: number[][] = []
@@ -188,7 +188,7 @@ describe('reactivity/tracking', () => {
       expectGraph(c as any)
     })
 
-    it.fails('should link a dep once when a nested run reads it between', () => {
+    it('should link a dep once when a nested run reads it between', () => {
       const a = ref(1)
       const inner = computed(() => a.value)
       const runner = effect(() => {

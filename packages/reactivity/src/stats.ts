@@ -12,6 +12,10 @@ export const stats: {
   hits: number
   /** Repeats proven by the dep's newest subscriber. */
   tailRepeats: number
+  /** Repeats of a dep read earlier in the run, found by a lookup. */
+  dups: number
+  /** Unread links moved to the cursor. */
+  moves: number
   /** Links created. */
   links: number
   /** Links removed. */
@@ -21,6 +25,8 @@ export const stats: {
   repeats: 0,
   hits: 0,
   tailRepeats: 0,
+  dups: 0,
+  moves: 0,
   links: 0,
   unlinks: 0,
 }
