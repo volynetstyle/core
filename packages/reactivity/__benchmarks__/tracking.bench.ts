@@ -3,7 +3,7 @@ import { test } from '../../../scripts/bench'
 import type { ComputedRef, Ref } from '../src'
 import * as reactivity from '../dist/reactivity.esm-browser.prod'
 
-const { computed, ref } = reactivity
+const { computed, effect, ref, stop } = reactivity
 
 declare module '../dist/reactivity.esm-browser.prod' {
   function computed(...args: any[]): any
@@ -120,6 +120,23 @@ describe('tracking', () => {
       await benchmark(() => {
         tick.value = ++i
         for (let k = 0; k < cs.length; k++) cs[k].value
+      })
+    })
+  }
+
+  {
+    const sources = range(32).map(i => ref(i))
+    for (let k = 0; k < 16; k++) {
+      effect(() => {
+        for (let j = 0; j < sources.length; j++) sources[j].value
+      })
+    }
+    test('first run: 32 deps that 16 effects read', async ({ benchmark }) => {
+      await benchmark(() => {
+        const runner = effect(() => {
+          for (let j = 0; j < sources.length; j++) sources[j].value
+        })
+        stop(runner)
       })
     })
   }
