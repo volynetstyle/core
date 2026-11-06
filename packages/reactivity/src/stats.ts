@@ -20,6 +20,8 @@ export const stats: {
   lookups: number
   /** Walks that mark the unread links of a run. */
   sweeps: number
+  /** Walks that index the deps of a run. */
+  indexes: number
   /** Links created. */
   links: number
   /** Links removed. */
@@ -33,6 +35,7 @@ export const stats: {
   moves: 0,
   lookups: 0,
   sweeps: 0,
+  indexes: 0,
   links: 0,
   unlinks: 0,
 }

@@ -144,7 +144,8 @@ export class ReactiveEffect<T = any>
     if (!this.active) {
       return
     }
-    this.flags = EffectFlags.STOP
+    // an effect stopped in its own run keeps its index until the run ends
+    this.flags = EffectFlags.STOP | (this.flags & ReactiveFlags.Indexed)
     let dep = this.deps
     while (dep !== undefined) {
       dep = unlink(dep, this)

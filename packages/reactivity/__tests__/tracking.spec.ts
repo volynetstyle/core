@@ -1,6 +1,6 @@
 import { type ComputedRef, type Ref, computed, effect, ref } from '../src'
 import { resetStats, stats } from '../src/stats'
-import type { ReactiveNode } from '../src/system'
+import { type ReactiveNode, isIndexIdle } from '../src/system'
 
 // Dependency tracking as structure: which links a run keeps, reuses, creates
 // and removes. An `it.fails` witness states a bound that the current
@@ -44,6 +44,23 @@ function expectGraph(sub: ReactiveNode): void {
   expect(sub.depsTail).toBe(prev)
   const deps = depsOf(sub)
   expect(new Set(deps).size).toBe(deps.length)
+}
+
+/** No index outlives its run, and no dep still points into one. */
+function expectReleased(deps: object[]): void {
+  expect(isIndexIdle()).toBe(true)
+  for (const dep of deps) {
+    expect((dep as ReactiveNode).indexLink).toBeUndefined()
+  }
+}
+
+/** Sources read by more subs than a subscriber lookup visits. */
+function wide(n: number): Ref<number>[] {
+  const sources = range(n).map(i => ref(i))
+  for (let k = 0; k < 10; k++) {
+    computed(() => sources.reduce((sum, s) => sum + s.value, 0)).value
+  }
+  return sources
 }
 
 /** A computed that reads `sources` in the order `orders[tick % length]`. */
@@ -181,7 +198,7 @@ describe('reactivity/tracking', () => {
       expect(stats.sweeps).toBe(0)
     })
 
-    it.fails('should reuse every link when shared reads shuffle', () => {
+    it('should reuse every link when shared reads shuffle', () => {
       const sources = range(64).map(i => ref(i))
       const orders = range(16).map(k => permutation(64, 0x9e3779b9 + k))
       const tick = ref(0)
@@ -192,7 +209,10 @@ describe('reactivity/tracking', () => {
           cs.forEach(c => c.value)
         }),
       ).toEqual({ links: 0, unlinks: 0 })
+      // one walk over the links per run at most: linear, not d²
+      expect(stats.sweeps + stats.indexes).toBeLessThanOrEqual(64 * 32)
       cs.forEach(c => expectGraph(c as any))
+      expectReleased(sources)
     })
   })
 
@@ -258,5 +278,167 @@ describe('reactivity/tracking', () => {
     })
     expect(stats.links).toBe(64)
     expect(stats.lookups).toBe(0)
+  })
+
+  describe('indexed runs', () => {
+    it('should keep the index of a run across a nested indexed run', () => {
+      const n = 12
+      const sources = wide(n)
+      const tick = ref(0)
+      const inner = computed(() => {
+        let sum = 0
+        for (const i of permutation(n, 300 + tick.value)) {
+          sum += sources[i].value
+        }
+        return sum
+      })
+      const outer = computed(() => {
+        const order = permutation(n, 900 + tick.value)
+        let sum = 0
+        for (const i of order) {
+          sum += sources[i].value
+        }
+        sum += inner.value
+        // Read again after the nested run indexed the same deps: one dep
+        // linked before this run indexed, one linked after (in a first run).
+        return sum + sources[order[0]].value + sources[order[n - 1]].value
+      })
+      for (let t = 0; t < 12; t++) {
+        tick.value = t
+        if (t === 1) {
+          resetStats()
+        }
+        outer.value
+        expect(depsOf(outer as any).length).toBe(n + 2)
+        expectGraph(outer as any)
+        expectGraph(inner as any)
+        expectReleased(sources)
+      }
+      expect(stats.indexes).toBeGreaterThan(0)
+      expect(stats.links).toBe(0)
+    })
+
+    it('should release the index of an effect stopped in its own run', () => {
+      const sources = wide(16)
+      const tick = ref(0)
+      let stopSelf = false
+      const runner = effect(() => {
+        const order = permutation(16, 7 + tick.value)
+        for (let k = 0; k < order.length; k++) {
+          sources[order[k]].value
+          if (stopSelf && k === 8) {
+            runner.effect.stop()
+          }
+        }
+      })
+      resetStats()
+      stopSelf = true
+      tick.value = 1
+      expect(stats.indexes).toBe(1)
+      expectReleased(sources)
+      sources.forEach(s => s.value++)
+      expectReleased(sources)
+    })
+
+    it('should not give back the index cell of a link removed meanwhile', () => {
+      const n = 16
+      const sources = wide(n)
+      const tick = ref(0)
+      let stopOuter = false
+      // eslint-disable-next-line prefer-const
+      let runner: ReturnType<typeof effect>
+      const inner = computed(() => {
+        let sum = 0
+        for (const i of permutation(n, 300 + tick.value)) {
+          sum += sources[i].value
+        }
+        if (stopOuter) {
+          runner.effect.stop()
+        }
+        return sum
+      })
+      runner = effect(() => {
+        for (const i of permutation(n, 900 + tick.value)) {
+          sources[i].value
+        }
+        inner.value
+      })
+      resetStats()
+      stopOuter = true
+      tick.value = 1
+      expect(stats.indexes).toBe(2)
+      expectReleased(sources)
+      expectGraph(inner as any)
+    })
+
+    it('should keep the index of a run its effect runs again from a nested run', () => {
+      const n = 16
+      const sources = wide(n)
+      const tick = ref(0)
+      let pass = 0
+      let reenter = false
+      // eslint-disable-next-line prefer-const
+      let runner: ReturnType<typeof effect>
+      const inner = computed(() => {
+        let sum = 0
+        for (const i of permutation(n, 300 + tick.value)) {
+          sum += sources[i].value
+        }
+        if (reenter) {
+          reenter = false
+          // a run of the effect above, inside this indexed run
+          runner()
+        }
+        return sum
+      })
+      runner = effect(() => {
+        tick.value
+        const order = permutation(n, 900 + pass++)
+        for (let k = 0; k < n; k++) {
+          sources[order[k]].value
+          if (k === n >> 1) {
+            inner.value
+          }
+        }
+      })
+      resetStats()
+      reenter = true
+      tick.value = 1
+      expect(stats.indexes).toBeGreaterThanOrEqual(3)
+      expectReleased(sources)
+      expect(new Set(depsOf(runner.effect))).toEqual(
+        new Set([tick, inner, ...sources]),
+      )
+      expectGraph(runner.effect)
+      expectGraph(inner as any)
+    })
+
+    it('should start over an indexed run its effect runs again within', () => {
+      const sources = wide(16)
+      const tick = ref(0)
+      let reenter = false
+      let pass = 0
+      const runner = effect(() => {
+        tick.value
+        // each run, the nested one included, reads its own order
+        const order = permutation(16, 7 + pass++)
+        for (let k = 0; k < order.length; k++) {
+          sources[order[k]].value
+          if (reenter && k === 8) {
+            reenter = false
+            runner()
+          }
+        }
+      })
+      resetStats()
+      reenter = true
+      tick.value = 1
+      expect(stats.indexes).toBeGreaterThan(0)
+      expectReleased(sources)
+      expect(new Set(depsOf(runner.effect))).toEqual(
+        new Set([tick, ...sources]),
+      )
+      expectGraph(runner.effect)
+    })
   })
 })

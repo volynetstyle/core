@@ -56,6 +56,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
 
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
+  indexLink: Link | undefined = undefined
   deps: Link | undefined = undefined
   depsTail: Link | undefined = undefined
   flags: SystemReactiveFlags =

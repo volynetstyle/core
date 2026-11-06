@@ -125,6 +125,7 @@ function createRef(rawValue: unknown, wrap?: <T>(v: T) => T) {
 class RefImpl<T = any> implements ReactiveNode {
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
+  indexLink: Link | undefined = undefined
   flags: _ReactiveFlags = _ReactiveFlags.Mutable
 
   _value: T
@@ -346,6 +347,7 @@ export type CustomRefFactory<T, S = T> = (
 class CustomRefImpl<T, S = T> implements ReactiveNode {
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
+  indexLink: Link | undefined = undefined
   flags: _ReactiveFlags = _ReactiveFlags.None
 
   private readonly _get: ReturnType<CustomRefFactory<T, S>>['get']

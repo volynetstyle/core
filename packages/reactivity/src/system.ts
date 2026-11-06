@@ -11,6 +11,8 @@ export interface ReactiveNode {
   depsTail?: Link
   subs?: Link
   subsTail?: Link
+  /** While a running sub indexes its deps: its link to this dep. */
+  indexLink?: Link
   flags: ReactiveFlags
 }
 
@@ -39,6 +41,12 @@ export const enum ReactiveFlags {
   Pending = 1 << 5,
   /** The running sub has marked the links it has not read yet `UNREAD`. */
   Marked = 1 << 6,
+  /**
+   * The sub has indexed its deps and its run has not ended. Kept by
+   * `ReactiveEffect.stop()`: the index of a stopped run ends with the run.
+   * (Bits 7, 8 and 10 are `EffectFlags`.)
+   */
+  Indexed = 1 << 9,
 }
 
 /**
@@ -49,6 +57,21 @@ const SCAN_BUDGET = 8
 
 /** `Link.version` of a link its sub's marked run has not read yet. */
 const UNREAD = -1
+
+/**
+ * The running sub that indexed its deps last: each of them points at its
+ * link through `indexLink`, until the run ends.
+ */
+let indexSub: ReactiveNode | undefined = undefined
+/** Where the cells displaced by the current index start in `indexStack`. */
+let indexBase = 0
+let indexTop = 0
+/**
+ * Per index, LIFO like the runs: the enclosing index's sub and base, and
+ * the sub's `Indexed` bit before; then the (dep, link) cells this index
+ * displaced, to give back when it ends.
+ */
+const indexStack: (ReactiveNode | Link | number | undefined)[] = []
 
 const notifyBuffer: (Effect | undefined)[] = []
 
@@ -115,16 +138,20 @@ function linkMiss(
   prevDep: Link | undefined,
   nextDep: Link | undefined,
 ): void {
-  // Only a running sub reconciles its reads with the last run (an effect
-  // scope links the effects it owns without running), and only for a dep
-  // that has subscribers: one without has no link to find.
-  if (
-    sub.flags & ReactiveFlags.RecursedCheck &&
-    dep.subs !== undefined &&
-    findLink(dep, sub, prevDep, nextDep)
-  ) {
+  // A tracked read reconciles with the last run exactly: a new link only
+  // where none exists. A dep without subscribers has none. (Not the
+  // `RecursedCheck` bit: a nested run of the same sub clears it early.)
+  if (sub === activeSub) {
+    if (dep.subsTail === undefined || !findLink(dep, sub, prevDep, nextDep)) {
+      insertLink(dep, sub, prevDep, nextDep)
+      if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
+        claimLink(dep, sub.depsTail!)
+      }
+    }
     return
   }
+  // An effect scope links the effects it owns without running: append,
+  // unless this dep was just appended.
   const prevSub = dep.subsTail
   if (
     prevSub !== undefined &&
@@ -134,7 +161,18 @@ function linkMiss(
     if (__TEST__) stats.tailRepeats++
     return
   }
+  insertLink(dep, sub, prevDep, nextDep)
+}
+
+/** Links `dep` to `sub` between `prevDep` and `nextDep`, as its newest sub. */
+function insertLink(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): void {
   if (__TEST__) stats.links++
+  const prevSub = dep.subsTail
   const newLink =
     (sub.depsTail =
     dep.subsTail =
@@ -163,13 +201,11 @@ function linkMiss(
 }
 
 /**
- * Looks for the link of a running `sub` to `dep`, moving it to the cursor if
- * this run has not read it yet. Near the cursor first: a few links ahead,
- * where the last run read `dep` later, or a few links behind, where this
- * run has read `dep` already. Then among the first subscribers of `dep`; a
- * link found there needs the run's unread links marked to tell whether it
- * was read. Returns false if the link does not exist, or if no bounded
- * search can find it.
+ * Finds the link of a running `sub` to `dep`, moving it to the cursor if
+ * this run has not read it yet; returns false if there is none. Near the
+ * cursor first: a few links ahead, where the last run read `dep` later, or
+ * a few links behind, where this run has read `dep` already. A run that
+ * has marked or indexed its links searches through `dep` at once.
  */
 function findLink(
   dep: ReactiveNode,
@@ -177,8 +213,7 @@ function findLink(
   prevDep: Link | undefined,
   nextDep: Link | undefined,
 ): boolean {
-  let found: Link | undefined | null
-  if (!(sub.flags & ReactiveFlags.Marked)) {
+  if (!(sub.flags & (ReactiveFlags.Marked | ReactiveFlags.Indexed))) {
     let ahead = nextDep !== undefined ? nextDep.nextDep : undefined
     let budget = SCAN_BUDGET
     while (ahead !== undefined && ahead.dep !== dep && --budget) {
@@ -201,26 +236,149 @@ function findLink(
     if (ahead === undefined && behind === undefined) {
       return false
     }
-    found = findSub(dep, sub)
+  }
+  return findThroughDep(dep, sub, prevDep, nextDep)
+}
+
+/**
+ * Finds the link through `dep`: among its first subscribers, or through
+ * the index. A link found among the subscribers needs the run's unread
+ * links marked to tell whether it was read. When the subscribers do not
+ * decide, the run indexes its deps, and lookups are exact from then on.
+ */
+function findThroughDep(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): boolean {
+  const flags = sub.flags
+  if (flags & ReactiveFlags.Indexed && indexSub === sub) {
+    return findIndexed(dep, sub, prevDep, nextDep)
+  }
+  const found = findSub(dep, sub)
+  if (found === undefined) {
+    return false
+  }
+  if (found === null) {
+    indexDeps(sub, nextDep)
+    return findIndexed(dep, sub, prevDep, nextDep)
+  }
+  if (!(flags & ReactiveFlags.Marked)) {
     // Found as the first subscriber, later lookups through the deps'
     // subscribers likely end at once: mark. Found deeper, each would walk
-    // other subs' links.
-    if (found === undefined || found === null || found !== dep.subs) {
-      return false
-    }
-    markUnread(sub, nextDep)
-  } else {
-    found = findSub(dep, sub)
-    if (found === undefined || found === null) {
-      return false
+    // other subs' links: index.
+    if (found === dep.subs) {
+      markUnread(sub, nextDep)
+    } else {
+      indexDeps(sub, nextDep)
     }
   }
-  if (found.version !== UNREAD) {
+  return takeLink(found, sub, prevDep, nextDep)
+}
+
+/** The lookup of an indexed run: `dep` points at its link if it has one. */
+function findIndexed(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): boolean {
+  const link = dep.indexLink
+  return (
+    link !== undefined &&
+    link.sub === sub &&
+    takeLink(link, sub, prevDep, nextDep)
+  )
+}
+
+/** A found link: moved to the cursor if unread, kept in place if read. */
+function takeLink(
+  link: Link,
+  sub: ReactiveNode,
+  prevDep: Link | undefined,
+  nextDep: Link | undefined,
+): true {
+  if (link.version !== UNREAD) {
     if (__TEST__) stats.dups++
   } else {
-    moveLink(found, sub, prevDep, nextDep!)
+    moveLink(link, sub, prevDep, nextDep!)
   }
   return true
+}
+
+/**
+ * Points each dep of `sub` at its link, and marks the links the run has not
+ * read yet, from `nextDep` on. The index lasts until the run ends.
+ */
+function indexDeps(sub: ReactiveNode, nextDep: Link | undefined): void {
+  if (__TEST__) stats.indexes++
+  indexStack[indexTop++] = indexSub
+  indexStack[indexTop++] = indexBase
+  // an enclosing run of the same sub may own an index further down
+  indexStack[indexTop++] = sub.flags & ReactiveFlags.Indexed
+  sub.flags |= ReactiveFlags.Indexed
+  indexSub = sub
+  indexBase = indexTop
+  let unread = false
+  for (let link = sub.deps; link !== undefined; link = link.nextDep) {
+    if (link === nextDep) {
+      unread = true
+    }
+    if (unread) {
+      link.version = UNREAD
+    }
+    claimLink(link.dep, link)
+  }
+}
+
+/** Points `dep` at `link`, keeping the cell of an enclosing index to give back. */
+function claimLink(dep: ReactiveNode, link: Link): void {
+  const cell = dep.indexLink
+  if (cell !== undefined) {
+    indexStack[indexTop++] = dep
+    indexStack[indexTop++] = cell
+  }
+  dep.indexLink = link
+}
+
+/**
+ * Ends the index of `sub`: clears its claims, gives back the cells it
+ * displaced (unless their link was removed meanwhile), and restores the
+ * enclosing index.
+ */
+function unindexDeps(sub: ReactiveNode): void {
+  for (let link = sub.deps; link !== undefined; link = link.nextDep) {
+    const dep: ReactiveNode = link.dep
+    if (dep.indexLink === link) {
+      dep.indexLink = undefined
+    }
+  }
+  while (indexTop > indexBase) {
+    const cell = indexStack[--indexTop] as Link
+    const dep = indexStack[--indexTop] as ReactiveNode
+    indexStack[indexTop] = indexStack[indexTop + 1] = undefined
+    dep.indexLink = isLinked(cell) ? cell : undefined
+  }
+  sub.flags =
+    (sub.flags & ~ReactiveFlags.Indexed) | (indexStack[--indexTop] as number)
+  indexBase = indexStack[--indexTop] as number
+  indexSub = indexStack[--indexTop] as ReactiveNode | undefined
+  indexStack[indexTop] =
+    indexStack[indexTop + 1] =
+    indexStack[indexTop + 2] =
+      undefined
+}
+
+/** No index is open: every run that indexed its deps has ended (tests). */
+export function isIndexIdle(): boolean {
+  return indexTop === 0 && indexSub === undefined
+}
+
+/** Whether `link` is still in its sub's list: no removed link is reinserted. */
+function isLinked(link: Link): boolean {
+  const prevDep = link.prevDep
+  return (prevDep !== undefined ? prevDep.nextDep : link.sub.deps) === link
 }
 
 /**
@@ -288,7 +446,11 @@ export function unlink(
   sub: ReactiveNode = link.sub,
 ): Link | undefined {
   if (__TEST__) stats.unlinks++
-  const dep = link.dep
+  const dep: ReactiveNode = link.dep
+  // e.g. a sub stopped during its own indexed run
+  if (dep.indexLink === link) {
+    dep.indexLink = undefined
+  }
   const prevDep = link.prevDep
   const nextDep = link.nextDep
   const nextSub = link.nextSub
@@ -397,6 +559,10 @@ export function propagate(link: Link): void {
 
 export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   ++globalVersion
+  // a run that starts inside its own indexed run starts over without it
+  if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
+    unindexDeps(sub)
+  }
   sub.depsTail = undefined
   sub.flags =
     (sub.flags &
@@ -422,6 +588,9 @@ export function endTracking(
   }
   activeSub = prevSub
 
+  if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
+    unindexDeps(sub)
+  }
   const depsTail = sub.depsTail
   let toRemove = depsTail !== undefined ? depsTail.nextDep : sub.deps
   while (toRemove !== undefined) {
