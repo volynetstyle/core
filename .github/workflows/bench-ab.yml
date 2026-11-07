@@ -1,0 +1,69 @@
+name: 'bench-ab'
+
+# A/B benchmark of @vue/reactivity: scripts/bench-ab/README.md
+on:
+  push:
+    branches:
+      - quant-bench
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'base revision'
+        default: 'origin/minor'
+      head:
+        description: 'head revision'
+        default: 'HEAD'
+      rounds:
+        description: 'ABBA rounds per workload'
+        default: '7'
+      filter:
+        description: 'workload name regex (empty: all)'
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # both revisions are built from history
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1.21.1
+        with:
+          node-version-file: '.node-version'
+          cache: true
+
+      - name: Benchmark
+        env:
+          BASE: ${{ inputs.base || 'origin/minor' }}
+          HEAD_REV: ${{ inputs.head || 'HEAD' }}
+          ROUNDS: ${{ inputs.rounds || '7' }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          node scripts/bench-ab/index.js "$BASE" "$HEAD_REV" \
+            --rounds "$ROUNDS" ${FILTER:+--filter "$FILTER"}
+
+      - name: Summary
+        if: always()
+        run: cat temp/bench-ab/report/report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-ab-report
+          path: temp/bench-ab/report/
+          if-no-files-found: ignore
