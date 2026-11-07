@@ -469,6 +469,102 @@ describe('reactivity/tracking', () => {
       expectGraph(c as any)
     })
 
+    it('should drop the slots of a run its effect runs again within', () => {
+      const n = 16
+      const sources = wide(n)
+      const tick = ref(0)
+      let reenter = false
+      let short = false
+      let pass = 0
+      const runner = effect(() => {
+        tick.value
+        // the nested run reads less: it cuts links the slots point at
+        if (short) return
+        const order = permutation(n, 50 + pass++)
+        for (let k = 0; k < n; k++) {
+          sources[order[k]].value
+          if (reenter && k === 8) {
+            reenter = false
+            short = true
+            runner()
+            short = false
+          }
+        }
+      })
+      reenter = true
+      tick.value++
+      expectReleased(sources)
+      expectGraph(runner.effect)
+      // an indexed run later must not find a slot into a removed link
+      tick.value++
+      expect(new Set(depsOf(runner.effect))).toEqual(
+        new Set([tick, ...sources]),
+      )
+      expectGraph(runner.effect)
+      expectReleased(sources)
+    })
+
+    it('should leave no slot of a run its effect ran again at its end', () => {
+      const n = 16
+      const sources = wide(n)
+      const tick = ref(0)
+      let reenter = false
+      let short = false
+      let pass = 0
+      let order: number[] = []
+      const runner = effect(() => {
+        tick.value
+        if (short) {
+          // the nested run keeps the first links, read in place: no index
+          for (let k = 0; k < 3; k++) sources[order[k]].value
+          return
+        }
+        order = permutation(n, 150 + pass++)
+        for (let k = 0; k < n; k++) {
+          sources[order[k]].value
+          if (reenter && k === n - 1) {
+            reenter = false
+            short = true
+            runner()
+            short = false
+          }
+        }
+      })
+      reenter = true
+      tick.value++
+      expectGraph(runner.effect)
+      expectReleased(sources)
+    })
+
+    it('should keep the slots of the run its effect runs again from', () => {
+      const n = 16
+      const sources = wide(n)
+      const tick = ref(0)
+      let reenter = false
+      // eslint-disable-next-line prefer-const
+      let runner: ReturnType<typeof effect>
+      const inner = computed(() => {
+        let sum = 0
+        for (const i of permutation(n, 70 + tick.value)) sum += sources[i].value
+        if (reenter) {
+          reenter = false
+          runner()
+        }
+        // reads again after the nested run: through its own slots
+        for (const i of permutation(n, 90 + tick.value)) sum += sources[i].value
+        return sum
+      })
+      runner = effect(() => {
+        for (const i of permutation(n, 110 + tick.value)) sources[i].value
+        inner.value
+      })
+      reenter = true
+      tick.value++
+      expectGraph(inner as any)
+      expectGraph(runner.effect)
+      expectReleased(sources)
+    })
+
     it('should start over an indexed run its effect runs again within', () => {
       const sources = wide(16)
       const tick = ref(0)
@@ -490,6 +586,8 @@ describe('reactivity/tracking', () => {
       reenter = true
       tick.value = 1
       expect(stats.indexes).toBeGreaterThan(0)
+      // the nested run takes over the links: it creates none
+      expect(stats.links).toBe(0)
       expectReleased(sources)
       expect(new Set(depsOf(runner.effect))).toEqual(
         new Set([tick, ...sources]),

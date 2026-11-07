@@ -109,26 +109,20 @@ const FAILED = -2
 const VERSION_MASK = 0x3fffffff
 
 /**
- * The running sub that indexed its deps last: each of them points at its
- * link through `indexLink`, until the run ends.
+ * One LIFO work stack shared by every walk (quant's): links to resume after
+ * a descent (push), links to climb back through (pull), (dep, cell) pairs an
+ * indexed run displaced, and the frames of runs: the base of the enclosing
+ * run. Every walk pops back to its own base before it returns; a run's
+ * displaced pairs lie between its frame and the top when it ends.
  */
-let indexSub: ReactiveNode | undefined = undefined
-/** Where the cells displaced by the current index start in `indexStack`. */
-let indexBase = 0
-let indexTop = 0
-/**
- * Per index, LIFO like the runs: the enclosing index's sub and base, and
- * the sub's `Indexed` bit before; then the (dep, link) cells this index
- * displaced, to give back when it ends.
- */
-const indexStack: (ReactiveNode | Link | number | undefined)[] = []
+const stack: (ReactiveNode | Link | number | undefined)[] = []
+/** First free slot of `stack`. */
+let top = 0
+/** Where the innermost run's pairs start: just above its frame. */
+let runBase = 0
 
-/** Deps whose last subscriber left: their own deps go next. */
+/** Deps whose last subscriber left: their own deps go next (Vue's liveness). */
 const orphans: ReactiveNode[] = []
-/** Push: the subscriber lists to resume after a descent. */
-const siblings: Link[] = []
-/** Pull: the link each node being checked was descended through. */
-const descent: Link[] = []
 
 const notifyBuffer: (Effect | undefined)[] = []
 
@@ -221,7 +215,7 @@ function linkMiss(
     return
   }
   const flags = sub.flags
-  if (flags & ReactiveFlags.Indexed && indexSub === sub) {
+  if (flags & ReactiveFlags.Indexed) {
     return slot(dep, sub, cursor, next)
   }
   /** The pair's link through the dep's subscribers; undefined: unknown. */
@@ -460,13 +454,7 @@ export function own(node: ReactiveNode, scope: ReactiveNode): void {
  */
 function indexDeps(sub: ReactiveNode, next: Link | undefined): void {
   if (__TEST__) stats.indexes++
-  indexStack[indexTop++] = indexSub
-  indexStack[indexTop++] = indexBase
-  // an enclosing run of the same sub may own an index further down
-  indexStack[indexTop++] = sub.flags & ReactiveFlags.Indexed
   sub.flags |= ReactiveFlags.Indexed
-  indexSub = sub
-  indexBase = indexTop
   let unread = false
   for (let link = sub.deps; link !== undefined; link = link.nextDep) {
     if (__TEST__) stats.indexWalk++
@@ -480,22 +468,21 @@ function indexDeps(sub: ReactiveNode, next: Link | undefined): void {
   }
 }
 
-/** Points `dep` at `link`, keeping the cell of an enclosing index to give back. */
+/** Points `dep` at `link`, keeping the cell of an enclosing run to give back. */
 function claimLink(dep: ReactiveNode, link: Link): void {
   const cell = dep.indexLink
   if (cell !== undefined) {
-    indexStack[indexTop++] = dep
-    indexStack[indexTop++] = cell
+    stack[top++] = dep
+    stack[top++] = cell
   }
   dep.indexLink = link
 }
 
 /**
- * Ends the index of `sub`: clears its claims, gives back the cells it
- * displaced (unless their link was removed meanwhile), and restores the
- * enclosing index.
+ * Clears the slots that point into `sub`'s links. Only its own: a run of
+ * the same sub may start inside a run of another sub, whose slots stay.
  */
-function unindexDeps(sub: ReactiveNode): void {
+function clearSlots(sub: ReactiveNode): void {
   for (let link = sub.deps; link !== undefined; link = link.nextDep) {
     if (__TEST__) stats.indexWalk++
     const dep: ReactiveNode = link.dep
@@ -503,42 +490,16 @@ function unindexDeps(sub: ReactiveNode): void {
       dep.indexLink = undefined
     }
   }
-  while (indexTop > indexBase) {
-    const cell = indexStack[--indexTop] as Link
-    const dep = indexStack[--indexTop] as ReactiveNode
-    indexStack[indexTop] = indexStack[indexTop + 1] = undefined
-    dep.indexLink = isLinked(cell) ? cell : undefined
-  }
-  sub.flags =
-    (sub.flags & ~ReactiveFlags.Indexed) | (indexStack[--indexTop] as number)
-  indexBase = indexStack[--indexTop] as number
-  indexSub = indexStack[--indexTop] as ReactiveNode | undefined
-  indexStack[indexTop] =
-    indexStack[indexTop + 1] =
-    indexStack[indexTop + 2] =
-      undefined
 }
 
-/** Whether `link` is still in its sub's list: no removed link is given back. */
-function isLinked(link: Link): boolean {
-  const prevDep = link.prevDep
-  return (prevDep !== undefined ? prevDep.nextDep : link.sub.deps) === link
-}
-
-/** No index is open: every run that indexed its deps has ended (tests). */
+/** No run or walk is in progress and the work stack is empty (tests). */
 export function isIndexIdle(): boolean {
-  return indexTop === 0 && indexSub === undefined
+  return top === 0 && runBase === 0
 }
 
-/** No run, index or walk is in progress, and the shared stacks are empty (tests). */
+/** isIndexIdle(), no active sub, and no orphan left to release (tests). */
 export function isKernelIdle(): boolean {
-  return (
-    isIndexIdle() &&
-    activeSub === undefined &&
-    orphans.length === 0 &&
-    siblings.length === 0 &&
-    descent.length === 0
-  )
+  return isIndexIdle() && activeSub === undefined && orphans.length === 0
 }
 
 // ---------------------------------------------------------------- removal
@@ -732,10 +693,10 @@ function isRead(link: Link, sub: ReactiveNode): boolean {
 
 /**
  * Marks everything below the subscriber list `first`: depth first, without
- * recursion; `siblings` holds where to resume after a descent.
+ * recursion; the work stack holds where to resume after a descent.
  */
 function markDeep(first: Link): void {
-  const base = siblings.length
+  const base = top
   let link: Link | undefined = first
   for (;;) {
     while (link !== undefined) {
@@ -744,7 +705,7 @@ function markDeep(first: Link): void {
         const subs = sub.subs
         if (subs !== undefined) {
           if (link.nextSub !== undefined) {
-            siblings.push(link.nextSub)
+            stack[top++] = link.nextSub
           }
           link = subs
           continue
@@ -752,10 +713,11 @@ function markDeep(first: Link): void {
       }
       link = link.nextSub
     }
-    if (siblings.length === base) {
+    if (top === base) {
       return
     }
-    link = siblings.pop()!
+    link = stack[--top] as Link
+    stack[top] = undefined
   }
 }
 
@@ -804,22 +766,31 @@ function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
 
 // -------------------------------------------------------------------- run
 
+/**
+ * Starts a run of `sub`: a frame on the work stack. A run that starts inside
+ * a run of the same sub (Vue lets an effect run itself) starts over: the
+ * enclosing run's slots go, and it goes on unindexed and unmarked; the cells
+ * it displaced are given back when it ends.
+ */
 export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
-  // a run that starts inside its own indexed run starts over without it
-  if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
-    unindexDeps(sub)
+  const flags = sub.flags
+  if (flags & ReactiveFlags.Indexed) {
+    clearSlots(sub)
   }
   if (__TEST__) stats.runs++
   sub.depsTail = undefined
   sub.flags =
-    (sub.flags &
+    (flags &
       ~(
         ReactiveFlags.Recursed |
         ReactiveFlags.Dirty |
         ReactiveFlags.Pending |
-        ReactiveFlags.Marked
+        ReactiveFlags.Marked |
+        ReactiveFlags.Indexed
       )) |
     ReactiveFlags.Running
+  stack[top++] = runBase
+  runBase = top
   return setActiveSub(sub)
 }
 
@@ -842,9 +813,23 @@ export function endTracking(
   }
   activeSub = prevSub
 
-  if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
-    unindexDeps(sub)
+  // The run's frame: clear its slots, give back the cells it displaced, pop
+  // back to the enclosing run. A cell is given back only to a run that is
+  // still indexed: a run of the same sub that started in between took the
+  // index of the run it is in apart. (A run that is indexed keeps its links
+  // until it ends: nothing removes them meanwhile.)
+  if (sub.flags & ReactiveFlags.Indexed) {
+    clearSlots(sub)
+    sub.flags &= ~ReactiveFlags.Indexed
   }
+  while (top > runBase) {
+    const cell = stack[--top] as Link
+    const dep = stack[--top] as ReactiveNode
+    stack[top] = stack[top + 1] = undefined
+    dep.indexLink = cell.sub.flags & ReactiveFlags.Indexed ? cell : undefined
+  }
+  runBase = stack[--top] as number
+  stack[top] = undefined
   if (sub.flags & ReactiveFlags.Disposed) {
     cut(sub, undefined)
     sub.flags &= ~(
@@ -919,7 +904,7 @@ export function flush(): void {
  * read it. Existential, in read order: deps are checked first to last and
  * the first changed one decides, so a dep the last run read only because
  * of an earlier one is not brought up to date for nothing. A Pending dep
- * is descended into (`descent` holds the link to come back through), a
+ * is descended into (the work stack holds the link to come back through), a
  * Dirty one is brought up to date, then versions decide. Without recursion
  * but the user's: bringing a computed up to date runs it.
  */
@@ -932,7 +917,7 @@ export function checkDirty(sub: ReactiveNode): boolean {
     return false
   }
   // Pending stays until decided: Dirty is set over it, as a push would
-  const base = descent.length
+  const base = top
   try {
     if (checkFrom(sub, base)) {
       sub.flags |= ReactiveFlags.Dirty
@@ -943,15 +928,14 @@ export function checkDirty(sub: ReactiveNode): boolean {
   } catch (error) {
     // every node still being checked owes a run; the root is handed back
     // so that the next push notifies it again
-    const top = descent.length
     if (top > base) {
-      const node: ReactiveNode = descent[top - 1].dep
+      const node: ReactiveNode = (stack[top - 1] as Link).dep
       owe(node, node.flags | ReactiveFlags.Dirty)
-      for (let i = base; i < top; i++) {
-        const sub: ReactiveNode = descent[i].sub
+      while (top > base) {
+        const sub: ReactiveNode = (stack[--top] as Link).sub
+        stack[top] = undefined
         owe(sub, sub.flags | ReactiveFlags.Dirty)
       }
-      descent.length = base
     }
     owe(sub, (sub.flags | ReactiveFlags.Dirty) & ~ReactiveFlags.Pending)
     throw error
@@ -970,7 +954,7 @@ function checkFrom(root: ReactiveNode, base: number): boolean {
         if (!(flags & ReactiveFlags.Dirty)) {
           // clearing Pending on the way down also ends a walk around a cycle
           dep.flags = flags & ~ReactiveFlags.Pending
-          descent.push(link)
+          stack[top++] = link
           node = dep
           link = dep.deps
           continue
@@ -997,7 +981,8 @@ function checkFrom(root: ReactiveNode, base: number): boolean {
     }
     // ascend: `node` is up to date; a node whose dep changed runs as well
     for (;;) {
-      const up = descent.pop()!
+      const up = stack[--top] as Link
+      stack[top] = undefined
       node = up.sub
       if ((up.dep as ReactiveNode).version === up.version) {
         link = up.nextDep
