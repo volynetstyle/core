@@ -21,6 +21,8 @@ export const stats: {
   scanned: number
   /** Runs that indexed their deps. */
   indexes: number
+  /** Runs that marked their unread links. */
+  sweeps: number
   /** Links created. */
   links: number
   /** Links removed. */
@@ -33,7 +35,7 @@ export const stats: {
   runs: number
   /** Subscribers visited by searches through a dep. */
   subScans: number
-  /** Links walked to index the deps of a run, or to end the index. */
+  /** Links walked to index or mark the deps of a run, or to end the index. */
   indexWalk: number
   /** Links walked to tell whether a running sub has read a link. */
   readWalk: number
@@ -49,6 +51,7 @@ export const stats: {
   lookups: 0,
   scanned: 0,
   indexes: 0,
+  sweeps: 0,
   links: 0,
   unlinks: 0,
   marks: 0,

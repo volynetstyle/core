@@ -86,6 +86,8 @@ export const enum ReactiveFlags {
    * (Bits 7, 8 and 10 are `EffectFlags`.)
    */
   Disposed = 1 << 9,
+  /** The running sub has marked the links it has not read yet `UNREAD`. */
+  Marked = 1 << 11,
 }
 
 /**
@@ -193,11 +195,15 @@ export function link(dep: ReactiveNode, sub: ReactiveNode): void {
 }
 
 /**
- * The slow half of `link()`, out of line so the fast half stays small. A
- * link found anywhere is the pair's only one; absence needs one side
- * searched completely: the sub's links on both sides of the cursor, or the
- * dep's subscribers. When neither bounded search decides, the run indexes
- * its deps and lookups are exact from then on.
+ * The slow half of `link()`, out of line so the fast half stays small. Every
+ * answer is exact; proofs come cheapest first: the dep read just before, a
+ * dep nobody reads, bounded scans of this run's links on both sides of the
+ * cursor, then the dep's first subscribers. Found as the dep's first
+ * subscriber, the link is taken and the run marks its unread suffix once:
+ * later lookups go through the deps' subscribers at no cost beyond the read.
+ * Found deeper, or not decided within the budget, the run indexes its deps
+ * and the slots decide from then on. (Unlike quant, a repeated read takes
+ * the dep's version: Vue's runs owe a run through the Dirty flag instead.)
  */
 function linkMiss(
   dep: ReactiveNode,
@@ -214,12 +220,19 @@ function linkMiss(
   if (dep === sub) {
     return
   }
-  if (!(sub.flags & ReactiveFlags.Indexed && indexSub === sub)) {
-    // a dep without subscribers has no link
+  const flags = sub.flags
+  if (flags & ReactiveFlags.Indexed && indexSub === sub) {
+    return slot(dep, sub, cursor, next)
+  }
+  /** The pair's link through the dep's subscribers; undefined: unknown. */
+  let found: Link | null | undefined
+  if (!(flags & ReactiveFlags.Marked)) {
+    // a dep without subscribers has no link (subsTail: Dep's subs is a getter)
     if (dep.subsTail === undefined) {
-      insertLink(dep, sub, cursor, next)
-      return
+      return insertLink(dep, sub, cursor, next)
     }
+    // A link found by a scan is the pair's only one; absence needs one side
+    // searched completely (this run's links, or the dep's subscribers).
     let ahead = next !== undefined ? next.nextDep : undefined
     let budget = SCAN_BUDGET
     while (ahead !== undefined && ahead.dep !== dep && --budget) {
@@ -243,44 +256,96 @@ function linkMiss(
       behind.version = dep.version!
       return
     }
-    // both scans reached the ends of the list, or the dep's few
-    // subscribers do not include this sub: there is no link
-    if (
-      (ahead === undefined && behind === undefined) ||
-      unsubscribed(dep, sub)
-    ) {
-      insertLink(dep, sub, cursor, next)
-      return
+    found = ahead === undefined && behind === undefined ? null : pair(dep, sub)
+    if (found !== null && found !== undefined) {
+      begin(dep, sub, found, next)
     }
-    indexDeps(sub, next)
+  } else {
+    found = pair(dep, sub)
   }
+  if (found === null) {
+    return insertLink(dep, sub, cursor, next)
+  }
+  if (found !== undefined) {
+    return take(found, dep, sub, cursor, next)
+  }
+  // past the budget: index the run, the slots decide from here on
+  indexDeps(sub, next)
+  slot(dep, sub, cursor, next)
+}
+
+/** An indexed run's lookup: the dep's slot holds the pair's link, or there is none. */
+function slot(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  cursor: Link | undefined,
+  next: Link | undefined,
+): void {
   if (__TEST__) stats.lookups++
   const cell = dep.indexLink
   if (cell !== undefined && cell.sub === sub) {
-    if (cell.version === UNREAD) {
-      if (__TEST__) stats.moves++
-      moveLink(cell, sub, cursor, next!)
-    } else {
-      if (__TEST__) stats.dups++
-    }
-    cell.version = dep.version!
-    return
+    return take(cell, dep, sub, cursor, next)
   }
   insertLink(dep, sub, cursor, next)
   claimLink(dep, sub.depsTail!)
 }
 
-/** Whether `dep` has fewer subscribers than the budget, and `sub` is not one. */
-function unsubscribed(dep: ReactiveNode, sub: ReactiveNode): boolean {
+/**
+ * The pair's link among the dep's first subscribers: null if the list ends
+ * first (there is none), undefined if the budget runs out (unknown).
+ */
+function pair(dep: ReactiveNode, sub: ReactiveNode): Link | null | undefined {
   if (__TEST__) stats.lookups++
   let budget = SCAN_BUDGET
   for (let link = dep.subs; link !== undefined; link = link.nextSub) {
     if (__TEST__) stats.subScans++
-    if (link.sub === sub || !--budget) {
-      return false
+    if (link.sub === sub) {
+      return link
+    }
+    if (!--budget) {
+      return undefined
     }
   }
-  return true
+  return null
+}
+
+/**
+ * How the run looks links up from here on, decided by where the found one
+ * is: the dep's first subscriber, the run marks its unread suffix from
+ * `next` on (a walk over links, not deps); deeper, it indexes.
+ */
+function begin(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  found: Link,
+  next: Link | undefined,
+): void {
+  if (found !== dep.subs) {
+    return indexDeps(sub, next)
+  }
+  if (__TEST__) stats.sweeps++
+  sub.flags |= ReactiveFlags.Marked
+  for (let link = next; link !== undefined; link = link.nextDep) {
+    if (__TEST__) stats.indexWalk++
+    link.version = UNREAD
+  }
+}
+
+/** A found link: an unread one moves to the cursor, a read one stays. */
+function take(
+  link: Link,
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  cursor: Link | undefined,
+  next: Link | undefined,
+): void {
+  if (link.version === UNREAD) {
+    if (__TEST__) stats.moves++
+    moveLink(link, sub, cursor, next!)
+  } else {
+    if (__TEST__) stats.dups++
+  }
+  link.version = dep.version!
 }
 
 /** A new link of a run at the cursor, as the newest subscriber of `dep`. */
@@ -748,7 +813,12 @@ export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   sub.depsTail = undefined
   sub.flags =
     (sub.flags &
-      ~(ReactiveFlags.Recursed | ReactiveFlags.Dirty | ReactiveFlags.Pending)) |
+      ~(
+        ReactiveFlags.Recursed |
+        ReactiveFlags.Dirty |
+        ReactiveFlags.Pending |
+        ReactiveFlags.Marked
+      )) |
     ReactiveFlags.Running
   return setActiveSub(sub)
 }

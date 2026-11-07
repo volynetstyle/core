@@ -1,4 +1,11 @@
-import { type ComputedRef, type Ref, computed, effect, ref } from '../src'
+import {
+  type ComputedRef,
+  type Ref,
+  computed,
+  effect,
+  reactive,
+  ref,
+} from '../src'
 import { resetStats, stats } from '../src/stats'
 import { type ReactiveNode, isIndexIdle, isKernelIdle } from '../src/system'
 
@@ -178,8 +185,10 @@ describe('reactivity/tracking', () => {
           c.value
         }),
       ).toEqual({ links: 0, unlinks: 0 })
-      // one walk over the links per run at most: linear, not d²
-      expect(stats.indexes).toBeLessThanOrEqual(64)
+      // the run is its deps' first subscriber: one walk over its unread
+      // links per run at most, and no index
+      expect(stats.sweeps).toBeLessThanOrEqual(64)
+      expect(stats.indexes).toBe(0)
       expectGraph(c as any)
     })
 
@@ -260,12 +269,28 @@ describe('reactivity/tracking', () => {
       resetStats()
       reenter = true
       tick.value = 1
-      expect(stats.indexes).toBeGreaterThan(0)
+      expect(stats.sweeps).toBeGreaterThan(0)
       expect(new Set(depsOf(runner.effect))).toEqual(
         new Set([tick, ...sources]),
       )
       expectGraph(runner.effect)
     })
+  })
+
+  it('should find an array length read again in a loop without an index', () => {
+    const arr = reactive(range(50))
+    const tick = ref(0)
+    const runner = effect(() => {
+      tick.value
+      for (let i = 0; i < arr.length; i++) arr[i]
+    })
+    resetStats()
+    tick.value++
+    // the length's first subscriber: the run marks its unread links once
+    expect(stats.indexes).toBe(0)
+    expect(stats.sweeps).toBe(1)
+    expect(stats.links + stats.unlinks).toBe(0)
+    expectGraph(runner.effect)
   })
 
   it('should link fresh deps without searching for their links', () => {
