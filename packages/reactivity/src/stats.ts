@@ -25,6 +25,12 @@ export const stats: {
   links: number
   /** Links removed. */
   unlinks: number
+  /** Links a push visited. */
+  marks: number
+  /** Links a check visited. */
+  checks: number
+  /** Runs started (effects and computeds). */
+  runs: number
 } = {
   reads: 0,
   hits: 0,
@@ -37,6 +43,9 @@ export const stats: {
   indexes: 0,
   links: 0,
   unlinks: 0,
+  marks: 0,
+  checks: 0,
+  runs: 0,
 }
 
 export function resetStats(): void {

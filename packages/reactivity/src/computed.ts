@@ -12,6 +12,7 @@ import {
   checkDirty,
   endTracking,
   link,
+  nextVersion,
   own,
   shallowPropagate,
   startTracking,
@@ -171,6 +172,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       const newValue = this.fn(oldValue)
       if (hasChanged(oldValue, newValue)) {
         this._value = newValue
+        this.version = nextVersion(this.version)
         return true
       }
       return false

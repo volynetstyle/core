@@ -29,7 +29,9 @@ import {
   activeSub,
   batchDepth,
   flush,
+  invalidate,
   link,
+  nextVersion,
   propagate,
   shallowPropagate,
 } from './system'
@@ -190,7 +192,7 @@ class RefImpl<T = any> implements ReactiveNode {
             oldValue,
           })
         }
-        propagate(subs)
+        invalidate(this)
         if (!batchDepth) {
           flush()
         }
@@ -203,7 +205,11 @@ class RefImpl<T = any> implements ReactiveNode {
 
   update(): boolean {
     this.flags &= ~_ReactiveFlags.Dirty
-    return hasChanged(this._oldValue, (this._oldValue = this._rawValue))
+    if (hasChanged(this._oldValue, (this._oldValue = this._rawValue))) {
+      this.version = nextVersion(this.version)
+      return true
+    }
+    return false
   }
 }
 
@@ -236,8 +242,7 @@ export function triggerRef(ref: Ref): void {
   // ref may be an instance of ObjectRefImpl
   const dep = (ref as unknown as RefImpl).dep
   if (dep !== undefined && dep.subs !== undefined) {
-    propagate(dep.subs)
-    shallowPropagate(dep.subs)
+    propagate(dep)
     if (!batchDepth) {
       flush()
     }

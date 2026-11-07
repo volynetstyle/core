@@ -11,7 +11,6 @@ import {
   flush,
   link,
   propagate,
-  shallowPropagate,
   startBatch,
 } from './system'
 
@@ -78,8 +77,7 @@ export function triggerDep(
         oldValue,
       })
     }
-    propagate(subs)
-    shallowPropagate(subs)
+    propagate(dep)
     if (!batchDepth) {
       flush()
     }
@@ -172,8 +170,7 @@ export function trigger(
           oldTarget,
         })
       }
-      propagate(dep.subs)
-      shallowPropagate(dep.subs)
+      propagate(dep)
       if (__DEV__) {
         triggerEventInfos.pop()
       }

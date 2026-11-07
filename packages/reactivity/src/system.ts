@@ -494,76 +494,118 @@ function releaseOrphans(base: number): void {
 
 // ------------------------------------------------------------------- push
 
-export function propagate(link: Link): void {
-  const base = siblings.length
-  let next = link.nextSub
+/** Keeps versions small integers. */
+const VERSION_MASK = 0x3fffffff
 
-  do {
+/** The version after `version`. */
+export function nextVersion(version: number): number {
+  return (version + 1) & VERSION_MASK
+}
+
+/**
+ * `dep` changed: its version advances, the subs that read it must run, and
+ * the subs below them may have to.
+ */
+export function propagate(dep: ReactiveNode): void {
+  dep.version = nextVersion(dep.version!)
+  for (let link = dep.subs; link !== undefined; link = link.nextSub) {
     const sub = link.sub
-    let flags = sub.flags
+    const flags = mark(link, sub)
+    if (
+      (sub.flags & (ReactiveFlags.Pending | ReactiveFlags.Dirty)) ===
+      ReactiveFlags.Pending
+    ) {
+      sub.flags |= ReactiveFlags.Dirty
+    }
+    if (flags & ReactiveFlags.Mutable && sub.subs !== undefined) {
+      markDeep(sub.subs)
+    }
+  }
+}
 
-    if (flags & (ReactiveFlags.Mutable | ReactiveFlags.Watching)) {
-      if (
-        !(
-          flags &
-          (ReactiveFlags.RecursedCheck |
-            ReactiveFlags.Recursed |
-            ReactiveFlags.Dirty |
-            ReactiveFlags.Pending)
-        )
-      ) {
-        sub.flags = flags | ReactiveFlags.Pending
-        if (runDepth) {
-          sub.flags |= ReactiveFlags.Recursed
-        }
-      } else if (
-        !(flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Recursed))
-      ) {
-        flags = ReactiveFlags.None
-      } else if (!(flags & ReactiveFlags.RecursedCheck)) {
-        sub.flags = (flags & ~ReactiveFlags.Recursed) | ReactiveFlags.Pending
-      } else if (
-        !(flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) &&
-        isValidLink(link, sub)
-      ) {
-        sub.flags = flags | ReactiveFlags.Recursed | ReactiveFlags.Pending
-        flags &= ReactiveFlags.Mutable
-      } else {
-        flags = ReactiveFlags.None
-      }
+/**
+ * `dep` may have changed (a ref set, not compared yet): the subs that read
+ * it settle that when they check.
+ */
+export function invalidate(dep: ReactiveNode): void {
+  const subs = dep.subs
+  if (subs !== undefined) {
+    markDeep(subs)
+  }
+}
 
-      if (flags & ReactiveFlags.Watching) {
-        notifyBuffer[notifyBufferLength++] = sub as Effect
-      }
-
-      if (flags & ReactiveFlags.Mutable) {
-        const subSubs = sub.subs
-        if (subSubs !== undefined) {
-          link = subSubs
-          if (subSubs.nextSub !== undefined) {
-            if (next !== undefined) {
-              siblings.push(next)
-            }
-            next = link.nextSub
+/**
+ * Marks everything below the subscriber list `first`: depth first, without
+ * recursion; `siblings` holds where to resume after a descent.
+ */
+function markDeep(first: Link): void {
+  const base = siblings.length
+  let link: Link | undefined = first
+  for (;;) {
+    while (link !== undefined) {
+      const sub: ReactiveNode = link.sub
+      if (mark(link, sub) & ReactiveFlags.Mutable) {
+        const subs = sub.subs
+        if (subs !== undefined) {
+          if (link.nextSub !== undefined) {
+            siblings.push(link.nextSub)
           }
+          link = subs
           continue
         }
       }
+      link = link.nextSub
     }
-
-    if ((link = next!) !== undefined) {
-      next = link.nextSub
-      continue
+    if (siblings.length === base) {
+      return
     }
+    link = siblings.pop()!
+  }
+}
 
-    if (siblings.length > base) {
-      link = siblings.pop()!
-      next = link.nextSub
-      continue
+/**
+ * Marks `sub` Pending through `link`, handing a watcher to the notify
+ * buffer; returns the flags the push goes on with: `Mutable` descends.
+ */
+function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
+  if (__TEST__) stats.marks++
+  let flags = sub.flags
+  if (!(flags & (ReactiveFlags.Mutable | ReactiveFlags.Watching))) {
+    // an effect scope owning a computed
+    return ReactiveFlags.None
+  }
+  if (
+    !(
+      flags &
+      (ReactiveFlags.RecursedCheck |
+        ReactiveFlags.Recursed |
+        ReactiveFlags.Dirty |
+        ReactiveFlags.Pending)
+    )
+  ) {
+    sub.flags = flags | ReactiveFlags.Pending
+    if (runDepth) {
+      sub.flags |= ReactiveFlags.Recursed
     }
-
-    break
-  } while (true)
+  } else if (
+    !(flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Recursed))
+  ) {
+    return ReactiveFlags.None
+  } else if (!(flags & ReactiveFlags.RecursedCheck)) {
+    sub.flags = (flags & ~ReactiveFlags.Recursed) | ReactiveFlags.Pending
+  } else if (
+    !(flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) &&
+    isValidLink(link, sub)
+  ) {
+    sub.flags = flags | ReactiveFlags.Recursed | ReactiveFlags.Pending
+    flags &= ReactiveFlags.Mutable
+  } else {
+    return ReactiveFlags.None
+  }
+  if (flags & ReactiveFlags.Watching) {
+    notifyBuffer[notifyBufferLength++] = sub as Effect
+  }
+  return flags
 }
 
 // -------------------------------------------------------------------- run
@@ -573,6 +615,7 @@ export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
     unindexDeps(sub)
   }
+  if (__TEST__) stats.runs++
   sub.depsTail = undefined
   sub.flags =
     (sub.flags &
@@ -639,6 +682,7 @@ export function checkDirty(link: Link, sub: ReactiveNode): boolean {
 
 function checkFrom(link: Link, sub: ReactiveNode, base: number): boolean {
   top: do {
+    if (__TEST__) stats.checks++
     const dep = link.dep
     const depFlags = dep.flags
 
