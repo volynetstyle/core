@@ -112,4 +112,59 @@ describe('reactivity/kernel', () => {
       expect(stats.marks - first).toBe(1)
     })
   })
+
+  describe('pull', () => {
+    it('should not bring up to date a dep read only behind a changed one', () => {
+      const flag = ref(true)
+      const s = ref(0)
+      const getter = vi.fn(() => s.value)
+      const c = computed(getter)
+      const spy = vi.fn(() => (flag.value ? c.value : 0))
+      effect(spy)
+      expect(getter).toHaveBeenCalledTimes(1)
+      startBatch()
+      s.value++
+      flag.value = false
+      endBatch()
+      // the flag decided first: the computed of the dropped branch never ran
+      expect(spy).toHaveBeenCalledTimes(2)
+      expect(getter).toHaveBeenCalledTimes(1)
+    })
+
+    it('should stop a check at the first dep that changed', () => {
+      const s = ref(0)
+      const first = computed(() => s.value)
+      const rest = range(32).map(i => computed(() => s.value + i))
+      let checksBeforeRun = -1
+      const spy = vi.fn(() => {
+        checksBeforeRun = stats.checks
+        first.value
+        rest.forEach(c => c.value)
+      })
+      effect(spy)
+      resetStats()
+      s.value++
+      expect(spy).toHaveBeenCalledTimes(2)
+      // the first dep changed: the check visited it and its one dep alone
+      expect(checksBeforeRun).toBe(2)
+      expect(isKernelIdle()).toBe(true)
+    })
+
+    it('should not run a sub whose Pending deps did not change', () => {
+      const s = ref(0)
+      const parity = computed(() => s.value % 2)
+      const chain = range(16).reduce<ComputedRef<number>>(
+        prev => computed(() => prev.value),
+        parity,
+      )
+      const spy = vi.fn(() => chain.value)
+      effect(spy)
+      resetStats()
+      s.value += 2
+      expect(spy).toHaveBeenCalledTimes(1)
+      // one run: the parity; the chain above it is only checked
+      expect(stats.runs).toBe(1)
+      expect(isKernelIdle()).toBe(true)
+    })
+  })
 })

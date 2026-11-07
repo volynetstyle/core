@@ -14,7 +14,6 @@ import {
   link,
   nextVersion,
   own,
-  shallowPropagate,
   startTracking,
 } from './system'
 import { warn } from './warning'
@@ -89,19 +88,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
    * for backwards compat
    */
   get _dirty(): boolean {
-    const flags = this.flags
-    if (flags & SystemReactiveFlags.Dirty) {
-      return true
-    }
-    if (flags & SystemReactiveFlags.Pending) {
-      if (checkDirty(this.deps!, this)) {
-        this.flags = flags | SystemReactiveFlags.Dirty
-        return true
-      } else {
-        this.flags = flags & ~SystemReactiveFlags.Pending
-      }
-    }
-    return false
+    return checkDirty(this)
   }
   /**
    * @internal
@@ -128,19 +115,11 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
   }
 
   get value(): T {
-    const flags = this.flags
     if (
-      flags & SystemReactiveFlags.Dirty ||
-      (flags & SystemReactiveFlags.Pending && checkDirty(this.deps!, this))
+      this.flags & (SystemReactiveFlags.Dirty | SystemReactiveFlags.Pending) &&
+      checkDirty(this)
     ) {
-      if (this.update()) {
-        const subs = this.subs
-        if (subs !== undefined) {
-          shallowPropagate(subs)
-        }
-      }
-    } else if (flags & SystemReactiveFlags.Pending) {
-      this.flags = flags & ~SystemReactiveFlags.Pending
+      this.update()
     }
     if (activeSub !== undefined) {
       if (__DEV__) {

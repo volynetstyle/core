@@ -164,19 +164,7 @@ export class ReactiveEffect<T = any>
   }
 
   get dirty(): boolean {
-    const flags = this.flags
-    if (flags & ReactiveFlags.Dirty) {
-      return true
-    }
-    if (flags & ReactiveFlags.Pending) {
-      if (checkDirty(this.deps!, this)) {
-        this.flags = flags | ReactiveFlags.Dirty
-        return true
-      } else {
-        this.flags = flags & ~ReactiveFlags.Pending
-      }
-    }
-    return false
+    return checkDirty(this)
   }
 }
 

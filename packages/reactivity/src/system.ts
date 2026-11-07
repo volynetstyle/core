@@ -26,6 +26,8 @@ export interface ReactiveNode {
   version?: number
   /** Of a dep: its link into the run that indexed its deps last. */
   indexLink?: Link
+  /** Of a computed or a ref: brings its value up to date; whether it changed. */
+  update?(): boolean
 }
 
 export interface Link {
@@ -508,13 +510,26 @@ export function nextVersion(version: number): number {
  */
 export function propagate(dep: ReactiveNode): void {
   dep.version = nextVersion(dep.version!)
+  push(dep, true)
+}
+
+/**
+ * `dep` may have changed (a ref set, not compared yet): the subs that read
+ * it settle that when they check.
+ */
+export function invalidate(dep: ReactiveNode): void {
+  push(dep, false)
+}
+
+function push(dep: ReactiveNode, changed: boolean): void {
   for (let link = dep.subs; link !== undefined; link = link.nextSub) {
     const sub = link.sub
+    const running = sub.flags & ReactiveFlags.RecursedCheck
     const flags = mark(link, sub)
-    if (
-      (sub.flags & (ReactiveFlags.Pending | ReactiveFlags.Dirty)) ===
-      ReactiveFlags.Pending
-    ) {
+    // A sub that read the old version must run. So must a running one that
+    // has read it (it is Pending then), even if it reads it again: in Vue a
+    // run that writes a dep it has read runs once more.
+    if (running ? sub.flags & ReactiveFlags.Pending : changed) {
       sub.flags |= ReactiveFlags.Dirty
     }
     if (flags & ReactiveFlags.Mutable && sub.subs !== undefined) {
@@ -523,15 +538,14 @@ export function propagate(dep: ReactiveNode): void {
   }
 }
 
-/**
- * `dep` may have changed (a ref set, not compared yet): the subs that read
- * it settle that when they check.
- */
-export function invalidate(dep: ReactiveNode): void {
-  const subs = dep.subs
-  if (subs !== undefined) {
-    markDeep(subs)
+/** Whether the running `sub` has read `link` in this run: at or before the cursor. */
+function isRead(link: Link, sub: ReactiveNode): boolean {
+  for (let l = sub.depsTail; l !== undefined; l = l.prevDep) {
+    if (l === link) {
+      return true
+    }
   }
+  return false
 }
 
 /**
@@ -569,37 +583,35 @@ function markDeep(first: Link): void {
  */
 function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
   if (__TEST__) stats.marks++
-  let flags = sub.flags
+  const flags = sub.flags
   if (!(flags & (ReactiveFlags.Mutable | ReactiveFlags.Watching))) {
     // an effect scope owning a computed
     return ReactiveFlags.None
   }
-  if (
-    !(
-      flags &
-      (ReactiveFlags.RecursedCheck |
-        ReactiveFlags.Recursed |
-        ReactiveFlags.Dirty |
-        ReactiveFlags.Pending)
-    )
-  ) {
-    sub.flags = flags | ReactiveFlags.Pending
-    if (runDepth) {
-      sub.flags |= ReactiveFlags.Recursed
+  if (flags & ReactiveFlags.RecursedCheck) {
+    // Running: a push through a link this run has not read yet changes
+    // nothing, the run reads the new state. Through one it has read, the
+    // sub is Pending and Recursed: a watcher is not notified in its own run
+    // (see ReactiveEffect.run()), a computed passes the push on.
+    if (
+      flags & (ReactiveFlags.Pending | ReactiveFlags.Dirty) ||
+      !isRead(link, sub)
+    ) {
+      return ReactiveFlags.None
     }
-  } else if (
-    !(flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Recursed))
-  ) {
-    return ReactiveFlags.None
-  } else if (!(flags & ReactiveFlags.RecursedCheck)) {
-    sub.flags = (flags & ~ReactiveFlags.Recursed) | ReactiveFlags.Pending
-  } else if (
-    !(flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) &&
-    isValidLink(link, sub)
-  ) {
-    sub.flags = flags | ReactiveFlags.Recursed | ReactiveFlags.Pending
-    flags &= ReactiveFlags.Mutable
+    sub.flags = flags | ReactiveFlags.Pending | ReactiveFlags.Recursed
+    return flags & ReactiveFlags.Mutable
+  }
+  if (!(flags & ReactiveFlags.Pending)) {
+    // Pushed while some effect runs: a push may still have to pass through
+    // here after this one was swallowed by a running watcher below.
+    sub.flags = runDepth
+      ? flags | ReactiveFlags.Pending | ReactiveFlags.Recursed
+      : flags | ReactiveFlags.Pending
+  } else if (flags & ReactiveFlags.Recursed) {
+    sub.flags = flags & ~ReactiveFlags.Recursed
   } else {
+    // marked already: so is everything below
     return ReactiveFlags.None
   }
   if (flags & ReactiveFlags.Watching) {
@@ -670,100 +682,83 @@ export function flush(): void {
 
 // ------------------------------------------------------------------- pull
 
-export function checkDirty(link: Link, sub: ReactiveNode): boolean {
+/**
+ * Whether `sub` must run: Dirty, or Pending and some dep changed since it
+ * read it. Existential, in read order: deps are checked first to last and
+ * the first changed one decides, so a dep the last run read only because
+ * of an earlier one is not brought up to date for nothing. A Pending dep
+ * is descended into (`descent` holds the link to come back through), a
+ * Dirty one is brought up to date, then versions decide. Without recursion
+ * but the user's: bringing a computed up to date runs it.
+ */
+export function checkDirty(sub: ReactiveNode): boolean {
+  const flags = sub.flags
+  if (flags & ReactiveFlags.Dirty) {
+    return true
+  }
+  if (!(flags & ReactiveFlags.Pending)) {
+    return false
+  }
+  // Pending stays until decided: Dirty is set over it, as a push would
   const base = descent.length
   try {
-    return checkFrom(link, sub, base)
+    if (checkFrom(sub, base)) {
+      sub.flags |= ReactiveFlags.Dirty
+      return true
+    }
+    sub.flags &= ~ReactiveFlags.Pending
+    return false
   } catch (error) {
     descent.length = base
     throw error
   }
 }
 
-function checkFrom(link: Link, sub: ReactiveNode, base: number): boolean {
-  top: do {
-    if (__TEST__) stats.checks++
-    const dep = link.dep
-    const depFlags = dep.flags
-
-    let dirty = false
-
-    if (sub.flags & ReactiveFlags.Dirty) {
-      dirty = true
-    } else if (
-      (depFlags & (ReactiveFlags.Mutable | ReactiveFlags.Dirty)) ===
-      (ReactiveFlags.Mutable | ReactiveFlags.Dirty)
-    ) {
-      const subs = dep.subs!
-      if ((dep as Computed).update()) {
-        if (subs.nextSub !== undefined) {
-          shallowPropagate(subs)
-        }
-        dirty = true
-      }
-    } else if (
-      (depFlags & (ReactiveFlags.Mutable | ReactiveFlags.Pending)) ===
-      (ReactiveFlags.Mutable | ReactiveFlags.Pending)
-    ) {
-      descent.push(link)
-      link = dep.deps!
-      sub = dep
-      continue
-    }
-
-    if (!dirty && link.nextDep !== undefined) {
-      link = link.nextDep
-      continue
-    }
-
-    while (descent.length > base) {
-      link = descent.pop()!
-      if (dirty) {
-        const subs = sub.subs!
-        if ((sub as Computed).update()) {
-          if (subs.nextSub !== undefined) {
-            shallowPropagate(subs)
-          }
-          sub = link.sub
+function checkFrom(root: ReactiveNode, base: number): boolean {
+  let node = root
+  let link = root.deps
+  for (;;) {
+    while (link !== undefined) {
+      if (__TEST__) stats.checks++
+      const dep: ReactiveNode = link.dep
+      const flags = dep.flags
+      if (flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) {
+        if (!(flags & ReactiveFlags.Dirty)) {
+          // clearing Pending on the way down also ends a walk around a cycle
+          dep.flags = flags & ~ReactiveFlags.Pending
+          descent.push(link)
+          node = dep
+          link = dep.deps
           continue
         }
-      } else {
-        sub.flags &= ~ReactiveFlags.Pending
+        // a computed runs, a ref compares its value
+        dep.update!()
       }
-      sub = link.sub
-      if (link.nextDep !== undefined) {
-        link = link.nextDep
-        continue top
+      if (dep.version !== link.version) {
+        break
       }
-      dirty = false
+      link = link.nextDep
     }
-
-    return dirty && !!sub.flags
-  } while (true)
-}
-
-export function shallowPropagate(link: Link): void {
-  do {
-    const sub = link.sub
-    const nextSub = link.nextSub
-    const subFlags = sub.flags
-    if (
-      (subFlags & (ReactiveFlags.Pending | ReactiveFlags.Dirty)) ===
-      ReactiveFlags.Pending
-    ) {
-      sub.flags = subFlags | ReactiveFlags.Dirty
+    if (link !== undefined) {
+      if (node === root) {
+        return true
+      }
+      node.update!()
+    } else if (node === root) {
+      return false
     }
-    link = nextSub!
-  } while (link !== undefined)
-}
-
-function isValidLink(checkLink: Link, sub: ReactiveNode): boolean {
-  let link = sub.depsTail
-  while (link !== undefined) {
-    if (link === checkLink) {
-      return true
+    // ascend: `node` is up to date; a node whose dep changed runs as well
+    for (;;) {
+      const up = descent.pop()!
+      node = up.sub
+      if ((up.dep as ReactiveNode).version === up.version) {
+        link = up.nextDep
+        break
+      }
+      if (node === root) {
+        return true
+      }
+      node.update!()
     }
-    link = link.prevDep
   }
-  return false
 }

@@ -33,7 +33,6 @@ import {
   link,
   nextVersion,
   propagate,
-  shallowPropagate,
 } from './system'
 
 declare const RefSymbol: unique symbol
@@ -159,13 +158,11 @@ class RefImpl<T = any> implements ReactiveNode {
   }
 
   get value(): T {
-    trackRef(this)
-    if (this.flags & _ReactiveFlags.Dirty && this.update()) {
-      const subs = this.subs
-      if (subs !== undefined) {
-        shallowPropagate(subs)
-      }
+    // settle first: the read records the version of the value it returns
+    if (this.flags & _ReactiveFlags.Dirty) {
+      this.update()
     }
+    trackRef(this)
     return this._value
   }
 
