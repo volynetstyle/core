@@ -20,7 +20,8 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 
-const BUNDLE = 'packages/reactivity/dist/reactivity.esm-browser.prod.js'
+const PROD = 'packages/reactivity/dist/reactivity.esm-browser.prod.js'
+const DEV = 'packages/reactivity/dist/reactivity.esm-browser.js'
 
 /**
  * @typedef {object} Bundle
@@ -35,29 +36,33 @@ const BUNDLE = 'packages/reactivity/dist/reactivity.esm-browser.prod.js'
 /**
  * @param {string} spec a git revision, `worktree` (the current files,
  *   uncommitted changes included), or a path to a built bundle
- * @param {{ root: string, cache: string, rebuild?: boolean, log: (s: string) => void }} options
+ * @param {{ root: string, cache: string, rebuild?: boolean, dev?: boolean, log: (s: string) => void }} options
+ *   `dev`: the development bundle (warnings, debug hooks) instead of the
+ *   production one
  * @returns {Bundle}
  */
-export function resolveBundle(spec, { root, cache, rebuild, log }) {
+export function resolveBundle(spec, { root, cache, rebuild, dev, log }) {
+  const bundle = dev ? DEV : PROD
+  const suffix = dev ? '.dev' : ''
   if (spec.endsWith('.js') && existsSync(spec)) {
     return describe(spec, path.resolve(spec))
   }
 
   if (spec === 'worktree') {
     log(`building the working tree`)
-    build(root)
-    const file = path.join(cache, 'bundles', `worktree.js`)
+    build(root, dev)
+    const file = path.join(cache, 'bundles', `worktree${suffix}.js`)
     mkdirSync(path.dirname(file), { recursive: true })
-    copyFileSync(path.join(root, BUNDLE), file)
+    copyFileSync(path.join(root, bundle), file)
     return describe(spec, file)
   }
 
   const commit = git(root, ['rev-parse', '--verify', `${spec}^{commit}`])
   const subject = git(root, ['log', '-1', '--format=%s', commit])
-  const file = path.join(cache, 'bundles', `${commit}.js`)
+  const file = path.join(cache, 'bundles', `${commit}${suffix}.js`)
   if (rebuild || !existsSync(file)) {
     log(`building ${spec} (${commit.slice(0, 9)}) in a worktree`)
-    buildCommit(root, cache, commit, file, log)
+    buildCommit(root, cache, commit, file, bundle, dev, log)
   }
   return { ...describe(spec, file), commit, subject }
 }
@@ -67,9 +72,11 @@ export function resolveBundle(spec, { root, cache, rebuild, log }) {
  * @param {string} cache
  * @param {string} commit
  * @param {string} file
+ * @param {string} bundle
+ * @param {boolean | undefined} dev
  * @param {(s: string) => void} log
  */
-function buildCommit(root, cache, commit, file, log) {
+function buildCommit(root, cache, commit, file, bundle, dev, log) {
   const dir = path.join(cache, 'worktrees', commit.slice(0, 12))
   const modules = path.join(dir, 'node_modules')
   if (existsSync(dir)) {
@@ -88,9 +95,9 @@ function buildCommit(root, cache, commit, file, log) {
     }
     // A junction needs no privileges on Windows; elsewhere `type` is ignored.
     symlinkSync(path.join(root, 'node_modules'), modules, 'junction')
-    build(dir)
+    build(dir, dev)
     mkdirSync(path.dirname(file), { recursive: true })
-    copyFileSync(path.join(dir, BUNDLE), file)
+    copyFileSync(path.join(dir, bundle), file)
     writeFileSync(
       file.replace(/\.js$/, '.json'),
       JSON.stringify(
@@ -136,11 +143,14 @@ function isLink(file) {
   }
 }
 
-/** @param {string} cwd */
-function build(cwd) {
+/**
+ * @param {string} cwd
+ * @param {boolean | undefined} dev
+ */
+function build(cwd, dev) {
   execFileSync(
     process.execPath,
-    ['scripts/build.js', '-pf', 'esm-browser', 'reactivity'],
+    ['scripts/build.js', dev ? '-f' : '-pf', 'esm-browser', 'reactivity'],
     { cwd, stdio: 'pipe' },
   )
 }
