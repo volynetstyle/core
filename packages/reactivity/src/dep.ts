@@ -18,6 +18,8 @@ import {
 export class Dep implements ReactiveNode {
   _subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
+  version = 0
+  indexLink: Link | undefined = undefined
   flags: ReactiveFlags = ReactiveFlags.None
 
   // a standalone dep has no map to leave once nothing subscribes it

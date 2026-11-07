@@ -12,6 +12,7 @@ import {
   checkDirty,
   endTracking,
   link,
+  own,
   shallowPropagate,
   startTracking,
 } from './system'
@@ -56,6 +57,8 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
 
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
+  version = 0
+  indexLink: Link | undefined = undefined
   deps: Link | undefined = undefined
   depsTail: Link | undefined = undefined
   flags: SystemReactiveFlags =
@@ -148,7 +151,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       }
       link(this, activeSub)
     } else if (activeEffectScope !== undefined) {
-      link(this, activeEffectScope)
+      own(this, activeEffectScope)
     }
     return this._value!
   }

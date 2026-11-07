@@ -10,10 +10,11 @@ import {
   decRunDepth,
   endTracking,
   incRunDepth,
-  link,
+  own,
   setActiveSub,
   startTracking,
   unlink,
+  unlinkDeps,
 } from './system'
 import { warn } from './warning'
 
@@ -87,7 +88,7 @@ export class ReactiveEffect<T = any>
       this.fn = fn
     }
     if (activeEffectScope) {
-      link(this, activeEffectScope)
+      own(this, activeEffectScope)
     }
   }
 
@@ -130,7 +131,10 @@ export class ReactiveEffect<T = any>
       decRunDepth()
       endTracking(this, prevSub)
       const flags = this.flags
-      if (
+      if (flags & EffectFlags.STOP) {
+        // stopped in this run: its links go now that the run is over
+        unlinkDeps(this)
+      } else if (
         (flags & (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)) ===
         (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)
       ) {
@@ -144,10 +148,13 @@ export class ReactiveEffect<T = any>
     if (!this.active) {
       return
     }
-    this.flags = EffectFlags.STOP
-    let dep = this.deps
-    while (dep !== undefined) {
-      dep = unlink(dep, this)
+    const flags = this.flags
+    // a run in progress keeps its links (and its index) until it ends
+    this.flags =
+      EffectFlags.STOP |
+      (flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Indexed))
+    if (!(flags & ReactiveFlags.RecursedCheck)) {
+      unlinkDeps(this)
     }
     const sub = this.subs
     if (sub !== undefined) {

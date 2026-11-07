@@ -1,5 +1,5 @@
 import { EffectFlags, cleanup } from './effect'
-import { type Link, type ReactiveNode, link, unlink } from './system'
+import { type Link, type ReactiveNode, own, unlink } from './system'
 import { warn } from './warning'
 
 export let activeEffectScope: EffectScope | undefined
@@ -22,7 +22,7 @@ export class EffectScope implements ReactiveNode {
 
   constructor(detached = false) {
     if (!detached && activeEffectScope) {
-      link(this, activeEffectScope)
+      own(this, activeEffectScope)
     }
   }
 
