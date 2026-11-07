@@ -4,7 +4,11 @@
 // `step` repeatedly and keeps nothing: the worker reports heap growth per
 // step between two equal halves (bytes; ~0 when nothing leaks).
 
-/** @typedef {{ unit: string, retained?: (R: any) => { n: number, keep: unknown }, churn?: (R: any) => () => void }} Scenario */
+// A `promotion` scenario runs `step` with only minor GCs: the old-space
+// growth per step is what scavenges could not free, e.g. dead objects a dead
+// but old link still points at (they live until a major GC).
+
+/** @typedef {{ unit: string, retained?: (R: any) => { n: number, keep: unknown }, churn?: (R: any) => () => void, promotion?: (R: any) => () => void }} Scenario */
 
 /** @type {Record<string, Scenario>} */
 export const scenarios = {
@@ -155,6 +159,34 @@ export const scenarios = {
         try {
           pick.value++
         } catch {}
+      }
+    },
+  },
+  'effect turnover (minor GC)': {
+    unit: 'B promoted / step',
+    promotion: R => {
+      // an old source; effects subscribe and stop in a sliding window
+      const s = R.ref(0)
+      const live = Array.from({ length: 32 }, () => R.effect(() => s.value))
+      return () => {
+        const payload = { a: 1, b: [1, 2, 3, 4] }
+        live.push(R.effect(() => s.value + payload.a))
+        live.shift().effect.stop()
+      }
+    },
+  },
+  'branch turnover (minor GC)': {
+    unit: 'B promoted / step',
+    promotion: R => {
+      // an old computed switches between fresh sources every step
+      const flag = R.ref(0)
+      /** @type {any[]} */
+      let sources = [R.ref(0), R.ref(1)]
+      const c = R.computed(() => sources[flag.value & 1].value)
+      R.effect(() => c.value)
+      return () => {
+        sources = [R.ref(0), R.ref(1)]
+        flag.value++
       }
     },
   },

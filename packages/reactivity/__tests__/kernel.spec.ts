@@ -3,6 +3,7 @@ import {
   EffectFlags,
   computed,
   effect,
+  effectScope,
   reactive,
   ref,
   shallowRef,
@@ -12,6 +13,7 @@ import {
 import { getDepFromReactive } from '../src/dep'
 import { resetStats, stats } from '../src/stats'
 import {
+  type Link,
   type ReactiveNode,
   endBatch,
   isKernelIdle,
@@ -406,6 +408,117 @@ describe('reactivity/kernel', () => {
       // which saw an error since
       fail.value = false
       expect(seen).toEqual([1, 'error', 1])
+    })
+  })
+
+  describe('removal', () => {
+    /** Links of `sub` in read order. */
+    const linksOf = (sub: object) => {
+      const out: Link[] = []
+      for (let l = (sub as ReactiveNode).deps; l !== undefined; l = l.nextDep) {
+        out.push(l)
+      }
+      return out
+    }
+    /** Every live link reachable from the nodes of the test. */
+    const live = (nodes: object[]) => {
+      const out = new Set<Link>()
+      for (const n of nodes as ReactiveNode[]) {
+        for (let l = n.deps; l !== undefined; l = l.nextDep) out.add(l)
+        for (let l = n.subs; l !== undefined; l = l.nextSub) out.add(l)
+      }
+      return out
+    }
+    /**
+     * A removed link points into no live list: no pointer of it reaches a
+     * live link (the nextDep chain inside a cut reaches removed ones only).
+     */
+    const expectDetached = (link: Link, alive: Set<Link>) => {
+      expect(alive.has(link)).toBe(false)
+      expect(link.prevSub).toBeUndefined()
+      expect(link.nextSub).toBeUndefined()
+      for (let l = link.prevDep; l !== undefined; l = l.prevDep) {
+        expect(alive.has(l)).toBe(false)
+      }
+      for (let l = link.nextDep; l !== undefined; l = l.nextDep) {
+        expect(alive.has(l)).toBe(false)
+      }
+    }
+
+    it('should detach the links a run no longer reads', () => {
+      const flag = ref(true)
+      const a = ref(1)
+      const b = ref(2)
+      // a has subscribers before and after the computed's link
+      effect(() => a.value)
+      const c = computed(() => (flag.value ? a.value + b.value : 0))
+      effect(() => c.value)
+      effect(() => a.value)
+      const [, toA, toB] = linksOf(c)
+      flag.value = false
+      const alive = live([flag, a, b, c])
+      expectDetached(toA, alive)
+      expectDetached(toB, alive)
+    })
+
+    it('should detach the links only an earlier failed run read', () => {
+      const mode = ref(0)
+      const x = ref(0)
+      const y = ref(0)
+      effect(() => x.value)
+      const c = computed(() => {
+        if (mode.value === 1) {
+          x.value
+          throw new Error('c')
+        }
+        if (mode.value === 2) throw new Error('c')
+        return y.value
+      })
+      effect(() => {
+        try {
+          c.value
+        } catch {}
+      })
+      effect(() => x.value)
+      expect(() => (mode.value = 1)).toThrow('c')
+      const toX = linksOf(c).find(l => l.dep === (x as any))!
+      // the effect runs now and catches: the failure is inside its run
+      mode.value = 2
+      expectDetached(toX, live([mode, x, y, c]))
+    })
+
+    it('should detach the links of a stopped effect and of what it released', () => {
+      const a = ref(0)
+      const b = ref(0)
+      effect(() => a.value + b.value)
+      const c = computed(() => a.value + b.value)
+      const runner = effect(() => c.value + a.value)
+      effect(() => a.value + b.value)
+      const own = linksOf(runner.effect)
+      const released = linksOf(c)
+      runner.effect.stop()
+      const alive = live([a, b, c, runner.effect])
+      for (const l of [...own, ...released]) expectDetached(l, alive)
+    })
+
+    it('should detach the link of an effect its scope stops', () => {
+      const a = ref(0)
+      const scope = effectScope()
+      scope.run(() => {
+        effect(() => a.value)
+        effect(() => a.value)
+        effect(() => a.value)
+      })
+      const owned = linksOf(scope)
+      scope.stop()
+      const alive = live([a, scope])
+      for (const l of owned) {
+        expect(alive.has(l)).toBe(false)
+        expect(l.prevDep).toBeUndefined()
+        expect(l.nextDep).toBeUndefined()
+        expect(l.prevSub).toBeUndefined()
+        expect(l.nextSub).toBeUndefined()
+      }
     })
   })
 })

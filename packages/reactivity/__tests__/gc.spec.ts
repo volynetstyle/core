@@ -192,4 +192,28 @@ describe.skipIf(!global.gc)('reactivity/gc', () => {
     expect((src as any).subs).toBeUndefined()
     expect((other as any).subs).toBeUndefined()
   })
+
+  it('should let scavenges free what removed links pointed at', async () => {
+    const { getHeapSpaceStatistics } = await import('node:v8')
+    const old = () =>
+      getHeapSpaceStatistics()
+        .filter(s => s.space_name === 'old_space')
+        .reduce((sum, s) => sum + s.space_used_size, 0)
+    const minor = global.gc as unknown as (o: { type: string }) => void
+    const src = ref(0)
+    const live = Array.from({ length: 32 }, () => effect(() => src.value))
+    await gc()
+    const steps = 20_000
+    const before = old()
+    for (let i = 0; i < steps; i++) {
+      const payload = { a: i, b: [i, i, i, i] }
+      live.push(effect(() => src.value + payload.a))
+      live.shift()!.effect.stop()
+      if ((i & 127) === 127) minor({ type: 'minor' })
+    }
+    minor({ type: 'minor' })
+    // a removed link of an old effect kept pointing at its younger neighbour,
+    // which was promoted with its effect: ~190 bytes per step before
+    expect((old() - before) / steps).toBeLessThan(40)
+  })
 })

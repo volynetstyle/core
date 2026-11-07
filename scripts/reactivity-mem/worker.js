@@ -1,5 +1,6 @@
 // @ts-check
 // One sample in a fresh process: node --expose-gc worker.js <bundle> <scenario>
+import v8 from 'node:v8'
 import { pathToFileURL } from 'node:url'
 import { scenarios } from './scenarios.js'
 
@@ -27,6 +28,30 @@ if (scenario.retained) {
   keep = scenario.retained(R)
   const after = /** @type {number} */ (await heap())
   value = (after - before) / keep.n
+} else if (scenario.promotion) {
+  const step = scenario.promotion(R)
+  gc()
+  gc()
+  const old = () =>
+    v8
+      .getHeapSpaceStatistics()
+      .filter(
+        s =>
+          s.space_name === 'old_space' || s.space_name === 'large_object_space',
+      )
+      .reduce((sum, s) => sum + s.space_used_size, 0)
+  const steps = 40_000
+  const before = old()
+  const minor = /** @type {(o: { type: string }) => void} */ (
+    /** @type {unknown} */ (gc)
+  )
+  for (let i = 0; i < steps; i++) {
+    step()
+    if ((i & 127) === 127) minor({ type: 'minor' })
+  }
+  minor({ type: 'minor' })
+  minor({ type: 'minor' })
+  value = (old() - before) / steps
 } else {
   const step = /** @type {() => void} */ (scenario.churn?.(R))
   const K = Number(process.env.MEM_STEPS ?? 4000)

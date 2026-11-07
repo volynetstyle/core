@@ -15,6 +15,16 @@
 // are loops over shared stacks. A failed run owes a run and keeps what
 // woke it.
 //
+// Removal invariant (quant's): a link taken out of a list keeps no pointer
+// into either list. A dead link that the scavenger sees as old keeps
+// whatever younger object it points at alive until a major GC: an old dead
+// link pins newer links, and through them their subs and closures. So
+// removal relinks the neighbours, then clears the link's own pointers:
+// unsubscribe() clears prevSub/nextSub, cut() the prevDep of the head of
+// what it cuts, unlink() and the removal of a failed run's links
+// prevDep/nextDep. Inside a cut, links keep the nextDep chain, which only
+// reaches garbage of the same cut. Any new removal path must do the same.
+//
 // Vue's policy on top: a running sub pushed through a link it has read is
 // Recursed (a watcher is not notified in its own run) and owes a run; a
 // dep that settles as changed marks its Pending subs Dirty (settled());
@@ -486,6 +496,7 @@ export function unlink(
   } else {
     sub.deps = nextDep
   }
+  link.prevDep = link.nextDep = undefined
   const base = orphans.length
   unsubscribe(link)
   if (orphans.length > base) {
@@ -506,6 +517,8 @@ function cut(sub: ReactiveNode, last: Link | undefined): void {
     sub.deps = undefined
   }
   sub.depsTail = last
+  // the head of the cut would tie it to the live list
+  link.prevDep = undefined
   const base = orphans.length
   do {
     unsubscribe(link)
@@ -549,6 +562,8 @@ function unsubscribe(link: Link): void {
   } else if ((dep.subs = nextSub) === undefined && dep.deps !== undefined) {
     orphans.push(dep)
   }
+  // subs are in birth order: an old removed link would point at younger ones
+  link.prevSub = link.nextSub = undefined
 }
 
 /**
@@ -793,6 +808,7 @@ export function endTracking(
       if (next !== undefined) {
         next.prevDep = prev
       }
+      link.prevDep = link.nextDep = undefined
       unsubscribe(link)
     }
     link = next
