@@ -1430,4 +1430,21 @@ describe('reactivity/effect', () => {
     expect(reads).toEqual(__DEV__ ? ['onTrack', 'onTrigger'] : [])
     stop(runner)
   })
+
+  test('should not lose a push through a computed that reads a dep twice apart', () => {
+    const a = ref(2)
+    const b = ref(1)
+    // reads a, then b, then a again when a is odd
+    const c = computed(() => (a.value & 1 ? (b.value + a.value) % 97 : b.value))
+    // writes a dep of the computed it reads, in its own run
+    effect(() => {
+      a.value = c.value
+    })
+    const seen: number[] = []
+    effect(() => seen.push(a.value))
+    b.value = 3
+    expect(seen).toEqual([1, 4])
+    b.value = 0
+    expect(seen).toEqual([1, 4, 0])
+  })
 })

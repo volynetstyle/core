@@ -1,6 +1,11 @@
 import { extend } from '@vue/shared'
 import type { DebuggerEventExtraInfo, ReactiveEffectOptions } from './effect'
-import { type Link, ReactiveFlags, type ReactiveNode } from './system'
+import {
+  type Link,
+  ReactiveFlags,
+  type ReactiveNode,
+  owingAfterFailure,
+} from './system'
 
 export const triggerEventInfos: DebuggerEventExtraInfo[] = []
 
@@ -68,12 +73,13 @@ function setupFlagsHandler(target: ReactiveNode): void {
       return (target as any)._flags
     },
     set(value) {
+      const flags = (target as any)._flags
       if (
-        !(
-          (target as any)._flags &
-          (ReactiveFlags.Dirty | ReactiveFlags.Pending)
-        ) &&
-        !!(value & (ReactiveFlags.Dirty | ReactiveFlags.Pending))
+        !owingAfterFailure &&
+        // marked, or pushed while it owes a run after a failure
+        ((!(flags & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) &&
+          value & (ReactiveFlags.Dirty | ReactiveFlags.Pending)) ||
+          (!(flags & ReactiveFlags.Pending) && value & ReactiveFlags.Pending))
       ) {
         onTrigger(this)
       }

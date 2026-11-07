@@ -15,6 +15,7 @@ import {
   linkFailed,
   nextVersion,
   own,
+  settled,
   startTracking,
 } from './system'
 import { warn } from './warning'
@@ -166,6 +167,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       if (hasChanged(oldValue, newValue)) {
         this._value = newValue
         this.version = nextVersion(this.version)
+        settled(this)
         return true
       }
       return false

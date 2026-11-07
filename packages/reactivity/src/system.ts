@@ -107,6 +107,19 @@ export let activeSub: ReactiveNode | undefined = undefined
 
 let runDepth = 0
 
+/**
+ * Dev: set while flags are written to owe a run after a failure, which is
+ * no trigger (the debug flags handler skips it).
+ */
+export let owingAfterFailure = false
+
+/** Writes `flags` that owe a run after a failure. */
+function owe(node: ReactiveNode, flags: ReactiveFlags): void {
+  if (__DEV__) owingAfterFailure = true
+  node.flags = flags
+  if (__DEV__) owingAfterFailure = false
+}
+
 export function incRunDepth(): void {
   ++runDepth
 }
@@ -555,12 +568,32 @@ function push(dep: ReactiveNode, changed: boolean): void {
     const flags = mark(link, sub)
     // A sub that read the old version must run. So must a running one that
     // has read it (it is Pending then), even if it reads it again: in Vue a
-    // run that writes a dep it has read runs once more.
-    if (running ? sub.flags & ReactiveFlags.Pending : changed) {
+    // run that writes a dep it has read runs once more. (For a ref, once it
+    // settles as changed: see settled().)
+    if (changed && (!running || sub.flags & ReactiveFlags.Pending)) {
       sub.flags |= ReactiveFlags.Dirty
     }
     if (flags & ReactiveFlags.Mutable && sub.subs !== undefined) {
       markDeep(sub.subs)
+    }
+  }
+}
+
+/**
+ * `dep` (a ref, a computed) settled as changed: the subs a push left Pending
+ * through it must run. They would find out by versions; marked, a check
+ * stops at once instead of bringing up to date the deps they read before.
+ * A running sub among them runs once more, as after propagate().
+ */
+export function settled(dep: ReactiveNode): void {
+  for (let link = dep.subs; link !== undefined; link = link.nextSub) {
+    const sub = link.sub
+    const flags = sub.flags
+    if (
+      (flags & (ReactiveFlags.Pending | ReactiveFlags.Dirty)) ===
+      ReactiveFlags.Pending
+    ) {
+      sub.flags = flags | ReactiveFlags.Dirty
     }
   }
 }
@@ -692,7 +725,7 @@ export function endTracking(
     sub.flags &= ~ReactiveFlags.RecursedCheck
     return
   }
-  sub.flags = (sub.flags & ~ReactiveFlags.RecursedCheck) | ReactiveFlags.Dirty
+  owe(sub, (sub.flags & ~ReactiveFlags.RecursedCheck) | ReactiveFlags.Dirty)
   const tentative = (sub.gen! + 1) & VERSION_MASK
   const base = orphans.length
   let link = cursor !== undefined ? cursor.nextDep : sub.deps
@@ -774,13 +807,15 @@ export function checkDirty(sub: ReactiveNode): boolean {
     // so that the next push notifies it again
     const top = descent.length
     if (top > base) {
-      descent[top - 1].dep.flags |= ReactiveFlags.Dirty
+      const node: ReactiveNode = descent[top - 1].dep
+      owe(node, node.flags | ReactiveFlags.Dirty)
       for (let i = base; i < top; i++) {
-        descent[i].sub.flags |= ReactiveFlags.Dirty
+        const sub: ReactiveNode = descent[i].sub
+        owe(sub, sub.flags | ReactiveFlags.Dirty)
       }
       descent.length = base
     }
-    sub.flags = (sub.flags | ReactiveFlags.Dirty) & ~ReactiveFlags.Pending
+    owe(sub, (sub.flags | ReactiveFlags.Dirty) & ~ReactiveFlags.Pending)
     throw error
   }
 }

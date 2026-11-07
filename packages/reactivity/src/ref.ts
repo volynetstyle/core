@@ -33,6 +33,7 @@ import {
   link,
   nextVersion,
   propagate,
+  settled,
 } from './system'
 
 declare const RefSymbol: unique symbol
@@ -204,6 +205,7 @@ class RefImpl<T = any> implements ReactiveNode {
     this.flags &= ~_ReactiveFlags.Dirty
     if (hasChanged(this._oldValue, (this._oldValue = this._rawValue))) {
       this.version = nextVersion(this.version)
+      settled(this)
       return true
     }
     return false

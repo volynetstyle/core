@@ -210,6 +210,42 @@ describe('reactivity/kernel', () => {
       expect(getter).toHaveBeenCalledTimes(1)
     })
 
+    it('should not bring up to date a dep read before a ref that changed', () => {
+      const s = ref(1)
+      const getter = vi.fn(() => s.value)
+      const before = computed(getter)
+      effect(() => before.value + s.value)
+      startBatch()
+      s.value = 0
+      // settles the ref: its Pending subs are Dirty now
+      s.value
+      endBatch()
+      // the effect ran on its direct dep; the computed ran once, in the run
+      expect(getter).toHaveBeenCalledTimes(2)
+    })
+
+    it('should not bring up to date a dep read before a computed that changed', () => {
+      const t = ref(0)
+      const s = ref(0)
+      const getter = vi.fn(() => t.value & 0)
+      const before = computed(getter)
+      const c = computed(() => s.value)
+      let skip = false
+      effect(() => {
+        if (!skip) before.value
+        c.value
+      })
+      skip = true
+      startBatch()
+      t.value++
+      s.value++
+      // brings the computed up to date: its Pending subs are Dirty now
+      c.value
+      endBatch()
+      // the effect ran at once, without the dep it no longer reads
+      expect(getter).toHaveBeenCalledTimes(1)
+    })
+
     it('should not run a sub whose Pending deps did not change', () => {
       const s = ref(0)
       const parity = computed(() => s.value % 2)
@@ -229,6 +265,31 @@ describe('reactivity/kernel', () => {
   })
 
   describe('failure', () => {
+    it('should not report a failed run as a trigger', () => {
+      const onTrigger = vi.fn()
+      const fail = ref(false)
+      const c = computed(
+        () => {
+          if (fail.value) throw new Error('c')
+          return 1
+        },
+        { onTrigger },
+      )
+      effect(() => {
+        try {
+          c.value
+        } catch {}
+      })
+      // the effect's check runs the computed, outside its try
+      expect(() => (fail.value = true)).toThrow('c')
+      expect(onTrigger).toHaveBeenCalledTimes(1)
+      expect(() => c.value).toThrow('c')
+      expect(onTrigger).toHaveBeenCalledTimes(1)
+      // pushed while it owes a run: a trigger
+      fail.value = false
+      expect(onTrigger).toHaveBeenCalledTimes(2)
+    })
+
     it('should run a computed again after it threw', () => {
       const fail = ref(true)
       const getter = vi.fn(() => {
