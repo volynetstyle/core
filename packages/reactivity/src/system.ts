@@ -39,11 +39,6 @@ export interface Link {
   nextDep: Link | undefined
 }
 
-interface Stack<T> {
-  value: T
-  prev: Stack<T> | undefined
-}
-
 export const enum ReactiveFlags {
   None = 0,
   Mutable = 1 << 0,
@@ -85,6 +80,10 @@ const indexStack: (ReactiveNode | Link | number | undefined)[] = []
 
 /** Deps whose last subscriber left: their own deps go next. */
 const orphans: ReactiveNode[] = []
+/** Push: the subscriber lists to resume after a descent. */
+const siblings: Link[] = []
+/** Pull: the link each node being checked was descended through. */
+const descent: Link[] = []
 
 const notifyBuffer: (Effect | undefined)[] = []
 
@@ -381,6 +380,17 @@ export function isIndexIdle(): boolean {
   return indexTop === 0 && indexSub === undefined
 }
 
+/** No run, index or walk is in progress, and the shared stacks are empty (tests). */
+export function isKernelIdle(): boolean {
+  return (
+    isIndexIdle() &&
+    activeSub === undefined &&
+    orphans.length === 0 &&
+    siblings.length === 0 &&
+    descent.length === 0
+  )
+}
+
 // ---------------------------------------------------------------- removal
 
 /** Removes `link` from both lists; returns the next link of its sub. */
@@ -485,10 +495,10 @@ function releaseOrphans(base: number): void {
 // ------------------------------------------------------------------- push
 
 export function propagate(link: Link): void {
+  const base = siblings.length
   let next = link.nextSub
-  let stack: Stack<Link | undefined> | undefined
 
-  top: do {
+  do {
     const sub = link.sub
     let flags = sub.flags
 
@@ -531,7 +541,9 @@ export function propagate(link: Link): void {
         if (subSubs !== undefined) {
           link = subSubs
           if (subSubs.nextSub !== undefined) {
-            stack = { value: next, prev: stack }
+            if (next !== undefined) {
+              siblings.push(next)
+            }
             next = link.nextSub
           }
           continue
@@ -544,13 +556,10 @@ export function propagate(link: Link): void {
       continue
     }
 
-    while (stack !== undefined) {
-      link = stack.value!
-      stack = stack.prev
-      if (link !== undefined) {
-        next = link.nextSub
-        continue top
-      }
+    if (siblings.length > base) {
+      link = siblings.pop()!
+      next = link.nextSub
+      continue
     }
 
     break
@@ -619,9 +628,16 @@ export function flush(): void {
 // ------------------------------------------------------------------- pull
 
 export function checkDirty(link: Link, sub: ReactiveNode): boolean {
-  let stack: Stack<Link> | undefined
-  let checkDepth = 0
+  const base = descent.length
+  try {
+    return checkFrom(link, sub, base)
+  } catch (error) {
+    descent.length = base
+    throw error
+  }
+}
 
+function checkFrom(link: Link, sub: ReactiveNode, base: number): boolean {
   top: do {
     const dep = link.dep
     const depFlags = dep.flags
@@ -645,10 +661,9 @@ export function checkDirty(link: Link, sub: ReactiveNode): boolean {
       (depFlags & (ReactiveFlags.Mutable | ReactiveFlags.Pending)) ===
       (ReactiveFlags.Mutable | ReactiveFlags.Pending)
     ) {
-      stack = { value: link, prev: stack }
+      descent.push(link)
       link = dep.deps!
       sub = dep
-      ++checkDepth
       continue
     }
 
@@ -657,10 +672,8 @@ export function checkDirty(link: Link, sub: ReactiveNode): boolean {
       continue
     }
 
-    while (checkDepth) {
-      --checkDepth
-      link = stack!.value
-      stack = stack!.prev
+    while (descent.length > base) {
+      link = descent.pop()!
       if (dirty) {
         const subs = sub.subs!
         if ((sub as Computed).update()) {

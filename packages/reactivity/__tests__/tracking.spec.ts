@@ -1,6 +1,6 @@
 import { type ComputedRef, type Ref, computed, effect, ref } from '../src'
 import { resetStats, stats } from '../src/stats'
-import { type ReactiveNode, isIndexIdle } from '../src/system'
+import { type ReactiveNode, isIndexIdle, isKernelIdle } from '../src/system'
 
 // Dependency tracking as structure: which links a run keeps, reuses, creates
 // and removes. An `it.fails` witness states a bound that the current
@@ -470,6 +470,39 @@ describe('reactivity/tracking', () => {
         new Set([tick, ...sources]),
       )
       expectGraph(runner.effect)
+    })
+  })
+
+  describe('shared stacks', () => {
+    it('should leave no walk behind when a computed throws in a check', () => {
+      const x = ref<any>({ y: 1 })
+      const c1 = computed(() => x.value.y)
+      const c2 = computed(() => c1.value + 1)
+      const c3 = computed(() => c2.value + 1)
+      const spy = vi.fn()
+      effect(() => spy(c3.value))
+      expect(isKernelIdle()).toBe(true)
+      expect(() => (x.value = undefined)).toThrow(TypeError)
+      expect(isKernelIdle()).toBe(true)
+      x.value = { y: 2 }
+      expect(isKernelIdle()).toBe(true)
+      expect(c3.value).toBe(4)
+    })
+
+    it('should walk a deep chain without recursion', () => {
+      const s = ref(0)
+      let last: ComputedRef<number> = computed(() => s.value)
+      for (let i = 0; i < 20_000; i++) {
+        const prev = last
+        last = computed(() => prev.value + 1)
+        // first runs nest (a computed runs the one it reads): warm up in order
+        last.value
+      }
+      const spy = vi.fn()
+      effect(() => spy(last.value))
+      s.value = 1
+      expect(spy).toHaveBeenLastCalledWith(20_001)
+      expect(isKernelIdle()).toBe(true)
     })
   })
 })
