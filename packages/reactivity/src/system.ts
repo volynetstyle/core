@@ -28,11 +28,15 @@ export interface ReactiveNode {
   indexLink?: Link
   /** Of a computed or a ref: brings its value up to date; whether it changed. */
   update?(): boolean
+  /** Of a sub: runs that succeeded so far; links born since are tentative. */
+  gen?: number
 }
 
 export interface Link {
   /** `dep.version` at the last read; `UNREAD` for a link its indexed run has not read yet. */
   version: number
+  /** `sub.gen + 1` at birth: equal to it while no run of the sub succeeded since. */
+  gen: number
   dep: ReactiveNode | Computed | Effect | EffectScope
   sub: ReactiveNode | Computed | Effect | EffectScope
   prevSub: Link | undefined
@@ -64,6 +68,15 @@ const SCAN_BUDGET = 8
 
 /** `Link.version` of a link its indexed run has not read yet. */
 const UNREAD = -1
+
+/**
+ * `Link.version` of a read that threw: no version of the dep matches it, so
+ * the sub runs again at the next push that reaches it.
+ */
+const FAILED = -2
+
+/** Keeps versions and generations small integers. */
+const VERSION_MASK = 0x3fffffff
 
 /**
  * The running sub that indexed its deps last: each of them points at its
@@ -243,7 +256,9 @@ function insertLink(
     (sub.depsTail =
     dep.subsTail =
       {
-        version: dep.version!,
+        // 0 for a link of an effect scope to what it owns
+        version: dep.version! | 0,
+        gen: (sub.gen! + 1) & VERSION_MASK,
         dep,
         sub,
         prevDep: cursor,
@@ -288,6 +303,21 @@ function moveLink(
     sub.deps = link
   }
   sub.depsTail = link
+}
+
+/**
+ * A read of `dep` by the running `sub` that threw while bringing `dep` up to
+ * date. It is a read still: the sub runs again once `dep` recovers, even
+ * with the value it had before. (Cold path: the link is found by a walk.)
+ */
+export function linkFailed(dep: ReactiveNode, sub: ReactiveNode): void {
+  link(dep, sub)
+  for (let l = sub.depsTail; l !== undefined; l = l.prevDep) {
+    if (l.dep === dep) {
+      l.version = FAILED
+      return
+    }
+  }
 }
 
 /**
@@ -496,9 +526,6 @@ function releaseOrphans(base: number): void {
 
 // ------------------------------------------------------------------- push
 
-/** Keeps versions small integers. */
-const VERSION_MASK = 0x3fffffff
-
 /** The version after `version`. */
 export function nextVersion(version: number): number {
   return (version + 1) & VERSION_MASK
@@ -636,9 +663,16 @@ export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   return setActiveSub(sub)
 }
 
+/**
+ * Ends the run of `sub`. A run that succeeded keeps the links it read and
+ * nothing else. A failed run owes a run: it keeps what woke it before
+ * (the links of its last successful run) and what it read, and drops the
+ * links earlier failed runs read that this one did not.
+ */
 export function endTracking(
   sub: ReactiveNode,
   prevSub: ReactiveNode | undefined,
+  failed = false,
 ): void {
   if (__DEV__ && activeSub !== sub) {
     warn(
@@ -651,9 +685,36 @@ export function endTracking(
   if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
     unindexDeps(sub)
   }
-  // the reads of this run end at the cursor
-  cut(sub, sub.depsTail)
-  sub.flags &= ~ReactiveFlags.RecursedCheck
+  const cursor = sub.depsTail
+  if (!failed) {
+    cut(sub, cursor)
+    sub.gen = (sub.gen! + 1) & VERSION_MASK
+    sub.flags &= ~ReactiveFlags.RecursedCheck
+    return
+  }
+  sub.flags = (sub.flags & ~ReactiveFlags.RecursedCheck) | ReactiveFlags.Dirty
+  const tentative = (sub.gen! + 1) & VERSION_MASK
+  const base = orphans.length
+  let link = cursor !== undefined ? cursor.nextDep : sub.deps
+  while (link !== undefined) {
+    const next: Link | undefined = link.nextDep
+    if (link.gen === tentative) {
+      const prev = link.prevDep
+      if (prev !== undefined) {
+        prev.nextDep = next
+      } else {
+        sub.deps = next
+      }
+      if (next !== undefined) {
+        next.prevDep = prev
+      }
+      unsubscribe(link)
+    }
+    link = next
+  }
+  if (orphans.length > base) {
+    releaseOrphans(base)
+  }
 }
 
 export function flush(): void {
@@ -709,7 +770,17 @@ export function checkDirty(sub: ReactiveNode): boolean {
     sub.flags &= ~ReactiveFlags.Pending
     return false
   } catch (error) {
-    descent.length = base
+    // every node still being checked owes a run; the root is handed back
+    // so that the next push notifies it again
+    const top = descent.length
+    if (top > base) {
+      descent[top - 1].dep.flags |= ReactiveFlags.Dirty
+      for (let i = base; i < top; i++) {
+        descent[i].sub.flags |= ReactiveFlags.Dirty
+      }
+      descent.length = base
+    }
+    sub.flags = (sub.flags | ReactiveFlags.Dirty) & ~ReactiveFlags.Pending
     throw error
   }
 }

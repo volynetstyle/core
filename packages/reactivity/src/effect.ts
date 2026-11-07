@@ -65,6 +65,7 @@ export class ReactiveEffect<T = any>
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
   flags: number = ReactiveFlags.Watching | ReactiveFlags.Dirty
+  gen = 0
 
   /**
    * @internal
@@ -125,18 +126,22 @@ export class ReactiveEffect<T = any>
     cleanup(this)
     const prevSub = startTracking(this)
     incRunDepth()
+    let failed = true
     try {
-      return this.fn()
+      const result = this.fn()
+      failed = false
+      return result
     } finally {
       decRunDepth()
-      endTracking(this, prevSub)
+      endTracking(this, prevSub, failed)
       const flags = this.flags
       if (flags & EffectFlags.STOP) {
         // stopped in this run: its links go now that the run is over
         unlinkDeps(this)
       } else if (
+        !failed &&
         (flags & (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)) ===
-        (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)
+          (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)
       ) {
         this.flags = flags & ~ReactiveFlags.Recursed
         this.notify()

@@ -13,6 +13,7 @@ import {
   onUnmounted,
   ref,
   render,
+  serializeInner,
   watch,
   watchEffect,
 } from '@vue/runtime-test'
@@ -794,6 +795,41 @@ describe('error handling', () => {
       app.unmount()
     },
   )
+
+  test('a render that threw on a computed updates once it recovers', async () => {
+    const fail = ref(false)
+    const n = ref(1)
+    const c = computed(() => {
+      if (fail.value) throw new Error('computed')
+      return n.value
+    })
+    const errors: unknown[] = []
+    const Child = { setup: () => () => String(c.value) }
+    const Comp = {
+      setup() {
+        onErrorCaptured(err => {
+          errors.push(err)
+          return false
+        })
+        return () => h(Child)
+      },
+    }
+    const root = nodeOps.createElement('div')
+    render(h(Comp), root)
+    expect(serializeInner(root)).toBe('1')
+
+    fail.value = true
+    await nextTick()
+    expect(errors.length).toBe(1)
+
+    // recovers with the value it had before it threw
+    fail.value = false
+    await nextTick()
+    expect(serializeInner(root)).toBe('1')
+    n.value = 2
+    await nextTick()
+    expect(serializeInner(root)).toBe('2')
+  })
 
   // native event handler handling should be tested in respective renderers
 })

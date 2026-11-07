@@ -12,6 +12,7 @@ import {
   checkDirty,
   endTracking,
   link,
+  linkFailed,
   nextVersion,
   own,
   startTracking,
@@ -60,6 +61,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
   version = 0
   indexLink: Link | undefined = undefined
   deps: Link | undefined = undefined
+  gen = 0
   depsTail: Link | undefined = undefined
   flags: SystemReactiveFlags =
     SystemReactiveFlags.Mutable | SystemReactiveFlags.Dirty
@@ -116,10 +118,20 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
 
   get value(): T {
     if (
-      this.flags & (SystemReactiveFlags.Dirty | SystemReactiveFlags.Pending) &&
-      checkDirty(this)
+      this.flags &
+      (SystemReactiveFlags.Dirty | SystemReactiveFlags.Pending)
     ) {
-      this.update()
+      try {
+        if (checkDirty(this)) {
+          this.update()
+        }
+      } catch (error) {
+        // the reader depends on this computed still
+        if (activeSub !== undefined) {
+          linkFailed(this, activeSub)
+        }
+        throw error
+      }
     }
     if (activeSub !== undefined) {
       if (__DEV__) {
@@ -146,9 +158,11 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
 
   update(): boolean {
     const prevSub = startTracking(this)
+    let failed = true
     try {
       const oldValue = this._value
       const newValue = this.fn(oldValue)
+      failed = false
       if (hasChanged(oldValue, newValue)) {
         this._value = newValue
         this.version = nextVersion(this.version)
@@ -156,7 +170,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       }
       return false
     } finally {
-      endTracking(this, prevSub)
+      endTracking(this, prevSub, failed)
     }
   }
 }
