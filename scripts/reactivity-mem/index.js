@@ -10,6 +10,7 @@
 // first K and the next K iterations: ~0 means nothing is retained.
 
 import { execFileSync } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -25,6 +26,7 @@ const { values: opts } = parseArgs({
     head: { type: 'string', default: 'worktree' },
     samples: { type: 'string', default: '3' },
     filter: { type: 'string' },
+    out: { type: 'string', default: 'temp/reactivity-mem' },
   },
 })
 const log = (/** @type {string} */ s) => process.stderr.write(`${s}\n`)
@@ -63,11 +65,41 @@ for (const name of names) {
   }
   const ma = median(a)
   const mb = median(b)
-  rows.push({ name, unit: scenarios[name].unit, oracle: ma, candidate: mb })
+  rows.push({ name, unit: scenarios[name].unit, base: ma, head: mb })
   log(
     `${name.padEnd(28)} ${scenarios[name].unit.padEnd(16)} ` +
       `oracle ${ma.toFixed(1).padStart(8)}  candidate ${mb.toFixed(1).padStart(8)}` +
       (ma > 0 ? `  ×${(mb / ma).toFixed(2)}` : ''),
   )
 }
-console.log(JSON.stringify(rows, null, 2))
+const kind = (/** @type {string} */ name) =>
+  scenarios[name].retained
+    ? 'retained'
+    : scenarios[name].promotion
+      ? 'promotion'
+      : 'churn'
+const md = [
+  `## Memory: ${head.commit?.slice(0, 9) ?? head.label} vs ${base.commit?.slice(0, 9) ?? base.label}`,
+  '',
+  'Production bundles, a fresh `node --expose-gc` process per sample, the ' +
+    `median of ${samples}. Retained: heap per unit after a full GC with the ` +
+    'graph alive. Churn: heap growth per step with nothing kept (~0: no ' +
+    'leak). Promotion: old-space growth per step under minor GCs only ' +
+    '(what scavenges could not free).',
+  '',
+  '| scenario | kind | unit | base | head |',
+  '| --- | --- | --- | ---: | ---: |',
+  ...rows.map(
+    r =>
+      `| ${r.name} | ${kind(r.name)} | ${r.unit} | ${r.base.toFixed(1)} | ${r.head.toFixed(1)} |`,
+  ),
+  '',
+].join('\n')
+const out = path.resolve(root, opts.out)
+mkdirSync(out, { recursive: true })
+writeFileSync(
+  path.join(out, 'memory.json'),
+  JSON.stringify({ base, head, samples, rows }, null, 2),
+)
+writeFileSync(path.join(out, 'memory.md'), md)
+console.log(md)

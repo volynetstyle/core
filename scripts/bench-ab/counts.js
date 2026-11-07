@@ -1,14 +1,17 @@
 // @ts-check
 // Structural counts of the bench-ab workloads, per step: what the kernel
 // did besides taking time. Runs the workloads from source under vitest
-// (counters are `__TEST__`-only) in this checkout and in an oracle checkout
-// whose kernel carries the same counters.
+// (counters are `__TEST__`-only) in this checkout and in a base checkout
+// whose kernel carries the same counters. Counts do not depend on the
+// machine: they are the part of a benchmark CI can compare exactly.
 //
-//   node scripts/bench-ab/counts.js [--oracle <dir>] [--steps n] [--filter re]
+//   node scripts/bench-ab/counts.js --base <rev> [--steps n] [--filter re]
+//   node scripts/bench-ab/counts.js --oracle <dir> ...
 //
-// The oracle checkout (default ../core-oracle) must have
-// packages/reactivity/src/stats.ts and counters in its system.ts; for an
-// alien-signals kernel, scratchpad shims do that (they are never committed).
+// --base runs in a throwaway worktree of <rev>; a kernel without counters
+// (alien-signals) gets them from counters-shim.js there. --oracle runs in an
+// existing checkout that has them. Writes temp/bench-ab/counts/counts.json
+// and counts.md (or --out <dir>).
 
 import { execFileSync } from 'node:child_process'
 import {
@@ -22,14 +25,18 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
+import { withWorktree } from './bundles.js'
+import { applyCountersShim } from './counters-shim.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const { values: opts } = parseArgs({
   options: {
-    oracle: { type: 'string', default: path.resolve(root, '../core-oracle') },
+    base: { type: 'string' },
+    oracle: { type: 'string' },
     steps: { type: 'string', default: '1000' },
     filter: { type: 'string', default: '' },
+    out: { type: 'string', default: 'temp/bench-ab/counts' },
   },
 })
 
@@ -76,10 +83,11 @@ function counts(tree) {
       path.join(here, 'workloads.js'),
       path.join(dir, 'workloads.js'),
     )
+    // vp's own entry, run by node: no shell, on every platform
     execFileSync(
-      process.platform === 'win32' ? 'npx.cmd' : 'npx',
+      process.execPath,
       [
-        'vp',
+        path.join(root, 'node_modules/vite-plus/bin/vp'),
         'test',
         'run',
         'packages/reactivity/__tests__/__counts__/counts.spec.ts',
@@ -87,7 +95,6 @@ function counts(tree) {
       {
         cwd: tree,
         stdio: 'pipe',
-        shell: process.platform === 'win32',
         env: {
           ...process.env,
           COUNTS_OUT: outFile,
@@ -103,7 +110,33 @@ function counts(tree) {
   }
 }
 
-const a = counts(opts.oracle)
+const log = (/** @type {string} */ s) => process.stderr.write(`${s}\n`)
+/** @type {{ label: string, commit?: string }} */
+let baseInfo
+/** @type {any} */
+let a
+if (opts.base) {
+  const commit = execFileSync(
+    'git',
+    ['rev-parse', '--verify', `${opts.base}^{commit}`],
+    {
+      cwd: root,
+      encoding: 'utf8',
+    },
+  ).trim()
+  baseInfo = { label: opts.base, commit }
+  a = withWorktree(root, path.join(root, 'temp/bench-ab'), commit, log, dir => {
+    if (applyCountersShim(dir))
+      log(`counters shim applied to ${commit.slice(0, 9)}`)
+    return counts(dir)
+  })
+} else if (opts.oracle) {
+  baseInfo = { label: opts.oracle }
+  a = counts(path.resolve(opts.oracle))
+} else {
+  log('usage: node scripts/bench-ab/counts.js --base <rev> | --oracle <dir>')
+  process.exit(2)
+}
 const b = counts(root)
 
 /** The columns: what a step allocates, removes and walks. */
@@ -121,38 +154,63 @@ const columns = {
 
 const fmt = (/** @type {number} */ x) =>
   x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2)
+/** @type {Record<string, any>[]} */
 const rows = []
 for (const name of Object.keys(b)) {
+  /** @type {Record<string, any>} */
   const row = { workload: name }
   for (const [col, f] of Object.entries(columns)) {
-    // @ts-ignore
-    row[col] = { oracle: f(a[name] ?? {}), candidate: f(b[name]) }
+    row[col] = { base: f(a[name] ?? {}), head: f(b[name]) }
   }
   rows.push(row)
 }
-const out = path.join(root, 'temp/bench-ab/counts.json')
-mkdirSync(path.dirname(out), { recursive: true })
-writeFileSync(out, JSON.stringify(rows, null, 2))
-
-const head = [
-  'workload'.padEnd(24),
-  ...Object.keys(columns).map(c => c.padStart(15)),
-].join('')
-console.log(head)
-console.log(
-  ' '.repeat(24) +
-    Object.keys(columns)
-      .map(() => 'oracle→cand'.padStart(15))
-      .join(''),
-)
-for (const row of rows) {
-  console.log(
-    // @ts-ignore
-    row.workload.padEnd(24) +
-      Object.keys(columns)
-        // @ts-ignore
-        .map(c => `${fmt(row[c].oracle)}→${fmt(row[c].candidate)}`.padStart(15))
-        .join(''),
-  )
+const headCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+  cwd: root,
+  encoding: 'utf8',
+}).trim()
+const dirty =
+  execFileSync('git', ['status', '--porcelain', '--', 'packages'], {
+    cwd: root,
+    encoding: 'utf8',
+  }).trim() !== ''
+const report = {
+  base: baseInfo,
+  head: { label: dirty ? 'worktree' : 'HEAD', commit: headCommit, dirty },
+  steps: Number(opts.steps),
+  rows,
 }
-console.log(`\n(per step; ${opts.steps} steps after 50 to warm up) ${out}`)
+const out = path.resolve(root, opts.out)
+mkdirSync(out, { recursive: true })
+writeFileSync(path.join(out, 'counts.json'), JSON.stringify(report, null, 2))
+
+const cols = Object.keys(columns)
+const md = [
+  `## Kernel work per step: ${report.head.label} vs ${baseInfo.label}`,
+  '',
+  `Counted from source (\`__TEST__\` counters), ${opts.steps} steps after 50 ` +
+    'to warm up; base → head. Machine independent: these compare exactly.',
+  '',
+  `| workload | ${cols.join(' | ')} |`,
+  `| --- | ${cols.map(() => '---:').join(' | ')} |`,
+  ...rows.map(
+    row =>
+      `| ${row.workload} | ` +
+      cols
+        .map(c => {
+          const { base, head } = row[c]
+          const cell = `${fmt(base)} → ${fmt(head)}`
+          return head < base ? `**${cell}**` : cell
+        })
+        .join(' | ') +
+      ' |',
+  ),
+  '',
+  'Columns: runs of effects and computeds; reads (link() calls); links ' +
+    'allocated and removed; scans (links and subscribers visited by searches, ' +
+    'and by the read check of running subs); index (links walked to index, ' +
+    'mark or unindex a run); push and pull visits; allocations (links, and ' +
+    'stack frames of an allocating walk). Bold: less work.',
+  '',
+].join('\n')
+writeFileSync(path.join(out, 'counts.md'), md)
+console.log(md)

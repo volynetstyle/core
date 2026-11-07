@@ -1,24 +1,38 @@
 name: 'bench-ab'
 
-# A/B benchmark of @vue/reactivity: scripts/bench-ab/README.md
+# A/B benchmark of @vue/reactivity between two revisions, on CI runners
+# rather than one developer machine. See scripts/bench-ab/README.md.
+#
+#   bundles  build both production bundles once from their commits, check
+#            that every workload computes the same on both, measure size
+#   timing   shard x replica: each job times its shard of workloads on its
+#            own runner (ABBA rounds, a fresh pinned process per sample);
+#            ratios are valid within a job only, never across jobs
+#   counts   kernel work per step from source: machine independent
+#   memory   heap per node and link, churn and minor-GC promotion
+#   report   one summary: a workload is faster or slower only if every
+#            replica says so beyond its own noise
+
 on:
   push:
     branches:
-      - quant-bench
+      - quant-kernel
+    paths:
+      - 'packages/reactivity/src/**'
+      - 'scripts/bench-ab/**'
+      - 'scripts/reactivity-mem/**'
+      - '.github/workflows/bench-ab.yml'
   workflow_dispatch:
     inputs:
       base:
-        description: 'base revision'
-        default: 'origin/minor'
+        description: 'base revision (default: Vue 3.6 minor, alien-signals kernel)'
+        default: '1a5397ae173335b3cb9b03e7fff6ace145b6f041'
       head:
-        description: 'head revision'
-        default: 'HEAD'
-      rounds:
-        description: 'ABBA rounds per workload'
-        default: '7'
-      filter:
-        description: 'workload name regex (empty: all)'
+        description: 'head revision (default: the commit of the run)'
         default: ''
+      rounds:
+        description: 'ABBA rounds per workload and replica'
+        default: '5'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,12 +41,20 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PUPPETEER_SKIP_DOWNLOAD: 'true'
+  BASE: ${{ inputs.base || '1a5397ae173335b3cb9b03e7fff6ace145b6f041' }}
+  HEAD_REV: ${{ inputs.head || github.sha }}
+  ROUNDS: ${{ inputs.rounds || '5' }}
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  bench:
+  bundles:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      PUPPETEER_SKIP_DOWNLOAD: 'true'
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,24 +68,158 @@ jobs:
           node-version-file: '.node-version'
           cache: true
 
-      - name: Benchmark
+      - name: Build both bundles
+        run: node scripts/bench-ab/prepare.js "$BASE" "$HEAD_REV" --out bench
+
+      - name: Same answers on both
+        run: node scripts/bench-ab/verify.js bench/base.js bench/head.js
+
+      - name: Size
+        run: node scripts/bench-ab/sizes.js bench/base.js bench/head.js --out artifacts/sizes
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-bundles
+          path: bench/
+          retention-days: 7
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sizes
+          path: artifacts/sizes/
+
+  timing:
+    needs: bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # three replicas: three runners, likely three machines
+        replica: [1, 2, 3]
+        shard:
+          - { name: tracking, filter: '^(stable|rotate|swap|shuffle|shared-shuffle)\.' }
+          - { name: lifecycle, filter: '^(first-run|branch)\.' }
+          - { name: propagation, filter: '^(write-read|fan-out|fan-in|chain|diamond)\.' }
+          - { name: real, filter: '^(real|failure)\.' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REV }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: '.node-version'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-bundles
+          path: bench
+
+      - name: Time ${{ matrix.shard.name }}
         env:
-          BASE: ${{ inputs.base || 'origin/minor' }}
-          HEAD_REV: ${{ inputs.head || 'HEAD' }}
-          ROUNDS: ${{ inputs.rounds || '7' }}
-          FILTER: ${{ inputs.filter }}
+          FILTER: ${{ matrix.shard.filter }}
         run: |
-          node scripts/bench-ab/index.js "$BASE" "$HEAD_REV" \
-            --rounds "$ROUNDS" ${FILTER:+--filter "$FILTER"}
+          nproc
+          node scripts/bench-ab/index.js bench/base.js bench/head.js \
+            --rounds "$ROUNDS" --filter "$FILTER" --out artifacts/timing
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: timing-${{ matrix.shard.name }}-${{ matrix.replica }}
+          path: artifacts/timing/
+          if-no-files-found: ignore
+
+  counts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REV }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1.21.1
+        with:
+          node-version-file: '.node-version'
+          cache: true
+
+      - name: Count
+        run: node scripts/bench-ab/counts.js --base "$BASE" --out artifacts/counts
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: counts
+          path: artifacts/counts/
+
+  memory:
+    needs: bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REV }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: '.node-version'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bench-bundles
+          path: bench
+
+      - name: Memory
+        run: |
+          node scripts/reactivity-mem --base bench/base.js --head bench/head.js \
+            --samples 3 --out artifacts/memory
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: memory
+          path: artifacts/memory/
+
+  report:
+    needs: [bundles, timing, counts, memory]
+    if: always() && needs.bundles.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.HEAD_REV }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: '.node-version'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: timing-*
+          path: in/timing
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '{counts,memory,sizes}'
+          path: in
 
       - name: Summary
-        if: always()
-        run: cat temp/bench-ab/report/report.md >> "$GITHUB_STEP_SUMMARY" || true
+        run: |
+          node scripts/bench-ab/aggregate.js --timing in/timing \
+            --counts in/counts/counts.json --memory in/memory/memory.json \
+            --sizes in/sizes/sizes.json --out summary
+          cat summary/summary.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload report
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bench-ab-report
-          path: temp/bench-ab/report/
+          name: bench-report
+          path: summary/
           if-no-files-found: ignore

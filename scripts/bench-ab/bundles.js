@@ -14,6 +14,8 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  rmSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -77,24 +79,7 @@ export function resolveBundle(spec, { root, cache, rebuild, dev, log }) {
  * @param {(s: string) => void} log
  */
 function buildCommit(root, cache, commit, file, bundle, dev, log) {
-  const dir = path.join(cache, 'worktrees', commit.slice(0, 12))
-  const modules = path.join(dir, 'node_modules')
-  if (existsSync(dir)) {
-    removeWorktree(root, dir, modules)
-  }
-  git(root, ['worktree', 'add', '--detach', dir, commit])
-  try {
-    // The lockfile decides which toolchain builds the bundle. A commit with
-    // another lockfile is built by this checkout's toolchain, not its own.
-    const lock = readFileSync(path.join(root, 'pnpm-lock.yaml'), 'utf8')
-    if (readFileSync(path.join(dir, 'pnpm-lock.yaml'), 'utf8') !== lock) {
-      log(
-        `warning: ${commit.slice(0, 9)} has another pnpm-lock.yaml; ` +
-          `it is built with the installed dependencies`,
-      )
-    }
-    // A junction needs no privileges on Windows; elsewhere `type` is ignored.
-    symlinkSync(path.join(root, 'node_modules'), modules, 'junction')
+  withWorktree(root, cache, commit, log, dir => {
     build(dir, dev)
     mkdirSync(path.dirname(file), { recursive: true })
     copyFileSync(path.join(dir, bundle), file)
@@ -111,26 +96,94 @@ function buildCommit(root, cache, commit, file, bundle, dev, log) {
         2,
       ),
     )
-  } finally {
-    removeWorktree(root, dir, modules)
-  }
+  })
 }
 
 /**
- * Removes the shared node_modules link first: a recursive delete must never
- * reach through it into this checkout's node_modules.
+ * Runs `fn` in a throwaway worktree of `commit` that shares this checkout's
+ * node_modules (the root's and each package's), and removes it after.
+ * @template T
+ * @param {string} root
+ * @param {string} cache
+ * @param {string} commit
+ * @param {(s: string) => void} log
+ * @param {(dir: string) => T} fn
+ * @returns {T}
+ */
+export function withWorktree(root, cache, commit, log, fn) {
+  const dir = path.join(cache, 'worktrees', commit.slice(0, 12))
+  if (existsSync(dir)) {
+    removeWorktree(root, dir)
+  }
+  git(root, ['worktree', 'add', '--detach', dir, commit])
+  try {
+    // The lockfile decides which toolchain runs. A commit with another
+    // lockfile runs with this checkout's dependencies, not its own.
+    const lock = readFileSync(path.join(root, 'pnpm-lock.yaml'), 'utf8')
+    if (readFileSync(path.join(dir, 'pnpm-lock.yaml'), 'utf8') !== lock) {
+      log(
+        `warning: ${commit.slice(0, 9)} has another pnpm-lock.yaml; ` +
+          `it runs with the installed dependencies`,
+      )
+    }
+    for (const modules of moduleDirs(root)) {
+      const target = path.join(dir, path.relative(root, modules))
+      if (existsSync(path.dirname(target)) && !existsSync(target)) {
+        // A junction needs no privileges on Windows; elsewhere `type` is ignored.
+        symlinkSync(modules, target, 'junction')
+      }
+    }
+    return fn(dir)
+  } finally {
+    removeWorktree(root, dir)
+  }
+}
+
+/** The node_modules directories of this checkout: the root's and each package's. */
+function moduleDirs(/** @type {string} */ root) {
+  const dirs = [path.join(root, 'node_modules')]
+  for (const group of ['packages', 'packages-private']) {
+    const base = path.join(root, group)
+    if (!existsSync(base)) continue
+    for (const name of readdirSync(base)) {
+      const modules = path.join(base, name, 'node_modules')
+      if (existsSync(modules)) dirs.push(modules)
+    }
+  }
+  return dirs
+}
+
+/**
+ * Removes the shared node_modules links first: a recursive delete must never
+ * reach through one of them into this checkout's node_modules.
  * @param {string} root
  * @param {string} dir
- * @param {string} modules
  */
-function removeWorktree(root, dir, modules) {
-  if (isLink(modules)) {
-    unlinkSync(modules)
+function removeWorktree(root, dir) {
+  for (const modules of moduleDirs(root)) {
+    const link = path.join(dir, path.relative(root, modules))
+    if (isLink(link)) {
+      unlinkSync(link)
+    }
+    if (existsSync(link)) {
+      throw new Error(`refusing to remove ${dir}: ${link} is not a link`)
+    }
   }
-  if (existsSync(modules)) {
-    throw new Error(`refusing to remove ${dir}: node_modules is not a link`)
+  try {
+    git(root, ['worktree', 'remove', '--force', dir])
+  } catch {
+    // Windows may still hold files of the build for a moment
+    try {
+      rmSync(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 200,
+      })
+    } catch (error) {
+      process.stderr.write(`warning: could not remove ${dir}: ${error}\n`)
+    }
   }
-  git(root, ['worktree', 'remove', '--force', dir])
   git(root, ['worktree', 'prune'])
 }
 
@@ -162,12 +215,20 @@ function build(cwd, dev) {
  */
 function describe(label, file) {
   const code = readFileSync(file)
-  return {
+  /** @type {Bundle} */
+  const bundle = {
     label,
     file,
     sha256: createHash('sha256').update(code).digest('hex'),
     size: code.length,
   }
+  // a bundle built from a commit carries its commit next to it
+  const meta = file.replace(/\.js$/, '.json')
+  if (existsSync(meta)) {
+    const { commit, subject } = JSON.parse(readFileSync(meta, 'utf8'))
+    Object.assign(bundle, { commit, subject })
+  }
+  return bundle
 }
 
 /**
