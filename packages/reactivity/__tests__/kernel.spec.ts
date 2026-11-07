@@ -12,13 +12,8 @@ import {
 } from '../src'
 import { getDepFromReactive } from '../src/dep'
 import { resetStats, stats } from '../src/stats'
-import {
-  type Link,
-  type ReactiveNode,
-  endBatch,
-  isKernelIdle,
-  startBatch,
-} from '../src/system'
+import { type Link, type ReactiveNode, isKernelIdle } from '../src/system'
+import { endBatch, startBatch } from '../src/batch'
 
 // The kernel as structure: versions, and how far a push and a check walk.
 

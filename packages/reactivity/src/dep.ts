@@ -6,13 +6,10 @@ import {
   ReactiveFlags,
   type ReactiveNode,
   activeSub,
-  batchDepth,
-  endBatch,
-  flush,
   link,
   propagate,
-  startBatch,
 } from './system'
+import { batchDepth, endBatch, flush, startBatch } from './batch'
 
 export class Dep implements ReactiveNode {
   _subs: Link | undefined = undefined

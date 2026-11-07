@@ -2,7 +2,9 @@
 // (github.com/volynetstyle/reflex-quant, packages/reflex-runtime-quant,
 // src/kernel.ts) under Vue's policy. Quant's host (its queue, batching and
 // watcher lifecycle) is not used: effects, effect scopes, batching and the
-// notify buffer are Vue's.
+// notify buffer are Vue's. The kernel knows its host by one call: wake()
+// (batch.ts) hands over a watcher a push reached, as quant's onWake() does;
+// bound statically, so that it is inlined and nothing runs at module load.
 //
 // A link is one edge threaded through two doubly linked lists: the sub's
 // `deps`, in the order of its last run's reads, and the dep's `subs`, in
@@ -29,9 +31,7 @@
 // Recursed (a watcher is not notified in its own run) and owes a run; a
 // dep that settles as changed marks its Pending subs Dirty (settled());
 // effect scopes own what they create through links (own()).
-import type { ComputedRefImpl as Computed } from './computed.js'
-import type { ReactiveEffect as Effect } from './effect.js'
-import type { EffectScope } from './effectScope.js'
+import { wake } from './batch.js'
 import { stats } from './stats.js'
 import { warn } from './warning.js'
 
@@ -57,8 +57,8 @@ export interface Link {
   version: number
   /** `sub.gen + 1` at birth: equal to it while no run of the sub succeeded since. */
   gen: number
-  dep: ReactiveNode | Computed | Effect | EffectScope
-  sub: ReactiveNode | Computed | Effect | EffectScope
+  dep: ReactiveNode
+  sub: ReactiveNode
   prevSub: Link | undefined
   nextSub: Link | undefined
   prevDep: Link | undefined
@@ -124,9 +124,6 @@ let runBase = 0
 /** Deps whose last subscriber left: their own deps go next (Vue's liveness). */
 const orphans: ReactiveNode[] = []
 
-const notifyBuffer: (Effect | undefined)[] = []
-
-export let batchDepth = 0
 export let activeSub: ReactiveNode | undefined = undefined
 
 let runDepth = 0
@@ -152,23 +149,10 @@ export function decRunDepth(): void {
   --runDepth
 }
 
-let notifyIndex = 0
-let notifyBufferLength = 0
-
 export function setActiveSub(sub?: ReactiveNode): ReactiveNode | undefined {
   const prevSub = activeSub
   activeSub = sub
   return prevSub
-}
-
-export function startBatch(): void {
-  ++batchDepth
-}
-
-export function endBatch(): void {
-  if (!--batchDepth && notifyBufferLength) {
-    flush()
-  }
 }
 
 // --------------------------------------------------------------- tracking
@@ -759,7 +743,7 @@ function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
     return ReactiveFlags.None
   }
   if (flags & ReactiveFlags.Watcher) {
-    notifyBuffer[notifyBufferLength++] = sub as Effect
+    wake(sub)
   }
   return flags
 }
@@ -870,30 +854,6 @@ export function endTracking(
   }
   if (orphans.length > base) {
     releaseOrphans(base)
-  }
-}
-
-export function flush(): void {
-  // a throwing subscriber must not abort the batch: keep notifying the rest,
-  // reset the queue, then rethrow the first error once the batch is drained.
-  let hasError = false
-  let error: unknown
-  while (notifyIndex < notifyBufferLength) {
-    const effect = notifyBuffer[notifyIndex]!
-    notifyBuffer[notifyIndex++] = undefined
-    try {
-      effect.notify()
-    } catch (err) {
-      if (!hasError) {
-        hasError = true
-        error = err
-      }
-    }
-  }
-  notifyIndex = 0
-  notifyBufferLength = 0
-  if (hasError) {
-    throw error
   }
 }
 

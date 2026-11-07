@@ -521,6 +521,23 @@ describe('reactivity/effect/scope', () => {
     expect(secondSpy).not.toHaveBeenCalled()
     expect(getEffectsCount(scope)).toBe(1)
   })
+
+  it('should resume every effect when one stops itself as it resumes', () => {
+    const scope = effectScope()
+    const src = ref(0)
+    const seen: string[] = []
+    scope.run(() => {
+      const first = effect(() => {
+        seen.push('first ' + src.value)
+        if (src.value > 0) first.effect.stop()
+      })
+      effect(() => seen.push('second ' + src.value))
+    })
+    scope.pause()
+    src.value = 1
+    scope.resume()
+    expect(seen).toEqual(['first 0', 'second 0', 'first 1', 'second 1'])
+  })
 })
 
 function getEffectsCount(scope: EffectScope): number {

@@ -27,14 +27,13 @@ import {
   type ReactiveNode,
   ReactiveFlags as _ReactiveFlags,
   activeSub,
-  batchDepth,
-  flush,
   invalidate,
   link,
   nextVersion,
   propagate,
   settled,
 } from './system'
+import { batchDepth, flush } from './batch'
 
 declare const RefSymbol: unique symbol
 export declare const RawSymbol: unique symbol

@@ -10,7 +10,8 @@ import {
   toReactive,
   toReadonly,
 } from './reactive'
-import { endBatch, setActiveSub, startBatch } from './system'
+import { setActiveSub } from './system'
+import { endBatch, startBatch } from './batch'
 
 /**
  * Track array iteration and return:

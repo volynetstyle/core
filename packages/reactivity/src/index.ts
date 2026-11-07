@@ -109,4 +109,5 @@ export {
 /**
  * @internal
  */
-export { activeSub, endBatch, setActiveSub, startBatch } from './system'
+export { activeSub, setActiveSub } from './system'
+export { endBatch, startBatch } from './batch'

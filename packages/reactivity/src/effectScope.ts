@@ -1,6 +1,10 @@
-import { EffectFlags, cleanup } from './effect'
+import type { ComputedRefImpl } from './computed'
+import { EffectFlags, type ReactiveEffect, cleanup } from './effect'
 import { type Link, type ReactiveNode, own, unlink } from './system'
 import { warn } from './warning'
+
+/** What a scope owns through its links: effects, child scopes, computeds. */
+type Owned = ReactiveEffect | EffectScope | ComputedRefImpl
 
 export let activeEffectScope: EffectScope | undefined
 
@@ -33,8 +37,10 @@ export class EffectScope implements ReactiveNode {
   pause(): void {
     if (!(this.flags & EffectFlags.PAUSED)) {
       this.flags |= EffectFlags.PAUSED
-      for (let link = this.deps; link !== undefined; link = link.nextDep) {
-        const dep = link.dep
+      for (let link = this.deps; link !== undefined;) {
+        const dep = link.dep as Owned
+        // read before: what it pauses may stop and leave the scope
+        link = link.nextDep
         if ('pause' in dep) {
           dep.pause()
         }
@@ -49,8 +55,10 @@ export class EffectScope implements ReactiveNode {
     const flags = this.flags
     if (flags & EffectFlags.PAUSED) {
       this.flags = flags & ~EffectFlags.PAUSED
-      for (let link = this.deps; link !== undefined; link = link.nextDep) {
-        const dep = link.dep
+      for (let link = this.deps; link !== undefined;) {
+        const dep = link.dep as Owned
+        // read before: what it resumes may run, stop and leave the scope
+        link = link.nextDep
         if ('resume' in dep) {
           dep.resume()
         }
@@ -86,7 +94,7 @@ export class EffectScope implements ReactiveNode {
   reset(): void {
     let dep = this.deps
     while (dep !== undefined) {
-      const node = dep.dep
+      const node = dep.dep as Owned
       if ('stop' in node) {
         dep = dep.nextDep
         node.stop()

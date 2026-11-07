@@ -23,7 +23,8 @@ import {
   toRaw,
   watch,
 } from '../src/index'
-import { type ReactiveNode, endBatch, startBatch } from '../src/system'
+import type { ReactiveNode } from '../src/system'
+import { endBatch, startBatch } from '../src/batch'
 
 describe('reactivity/effect', () => {
   it('should run the passed function once (wrapped by a effect)', () => {
