@@ -8,13 +8,13 @@ import {
   activeSub,
   checkDirty,
   decRunDepth,
+  dispose,
   endTracking,
   incRunDepth,
   own,
   setActiveSub,
   startTracking,
   unlink,
-  unlinkDeps,
 } from './system'
 import { warn } from './warning'
 
@@ -64,7 +64,7 @@ export class ReactiveEffect<T = any>
   depsTail: Link | undefined = undefined
   subs: Link | undefined = undefined
   subsTail: Link | undefined = undefined
-  flags: number = ReactiveFlags.Watching | ReactiveFlags.Dirty
+  flags: number = ReactiveFlags.Watcher | ReactiveFlags.Dirty
   gen = 0
 
   /**
@@ -99,7 +99,7 @@ export class ReactiveEffect<T = any>
 
   /** @internal */
   get running(): boolean {
-    return !!(this.flags & ReactiveFlags.RecursedCheck)
+    return !!(this.flags & ReactiveFlags.Running)
   }
 
   pause(): void {
@@ -135,10 +135,7 @@ export class ReactiveEffect<T = any>
       decRunDepth()
       endTracking(this, prevSub, failed)
       const flags = this.flags
-      if (flags & EffectFlags.STOP) {
-        // stopped in this run: its links go now that the run is over
-        unlinkDeps(this)
-      } else if (
+      if (
         !failed &&
         (flags & (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)) ===
           (ReactiveFlags.Recursed | EffectFlags.ALLOW_RECURSE)
@@ -153,14 +150,11 @@ export class ReactiveEffect<T = any>
     if (!this.active) {
       return
     }
-    const flags = this.flags
-    // a run in progress keeps its links (and its index) until it ends
+    // a run in progress keeps its kernel bits: its links go when it ends
     this.flags =
       EffectFlags.STOP |
-      (flags & (ReactiveFlags.RecursedCheck | ReactiveFlags.Indexed))
-    if (!(flags & ReactiveFlags.RecursedCheck)) {
-      unlinkDeps(this)
-    }
+      (this.flags & (ReactiveFlags.Running | ReactiveFlags.Indexed))
+    dispose(this)
     const sub = this.subs
     if (sub !== undefined) {
       unlink(sub)

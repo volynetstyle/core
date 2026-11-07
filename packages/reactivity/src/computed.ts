@@ -65,7 +65,7 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
   gen = 0
   depsTail: Link | undefined = undefined
   flags: SystemReactiveFlags =
-    SystemReactiveFlags.Mutable | SystemReactiveFlags.Dirty
+    SystemReactiveFlags.Computed | SystemReactiveFlags.Dirty
 
   /**
    * @internal

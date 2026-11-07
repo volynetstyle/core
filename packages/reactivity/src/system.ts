@@ -1,14 +1,24 @@
-// Reactive kernel, being ported from reflex-runtime-quant
+// Reactive kernel: the kernel of reflex-runtime-quant
 // (github.com/volynetstyle/reflex-quant, packages/reflex-runtime-quant,
-// src/kernel.ts). Quant's host (its queue, batching and watcher lifecycle) is
-// not ported: effects, effect scopes, batching and the notify buffer keep
-// Vue's policy.
+// src/kernel.ts) under Vue's policy. Quant's host (its queue, batching and
+// watcher lifecycle) is not used: effects, effect scopes, batching and the
+// notify buffer are Vue's.
 //
 // A link is one edge threaded through two doubly linked lists: the sub's
 // `deps`, in the order of its last run's reads, and the dep's `subs`, in
 // birth order. A run reconciles its reads with the last run's links at a
 // cursor (`depsTail`); a read that misses the cursor is found by bounded
 // scans, then through the dep, then through an index of the run's links.
+// Deps carry versions, and a link the version it read. Push marks subs
+// Pending (the direct subs of a change Dirty) and hands watchers to the
+// notify buffer; pull walks deps in read order and versions decide. Both
+// are loops over shared stacks. A failed run owes a run and keeps what
+// woke it.
+//
+// Vue's policy on top: a running sub pushed through a link it has read is
+// Recursed (a watcher is not notified in its own run) and owes a run; a
+// dep that settles as changed marks its Pending subs Dirty (settled());
+// effect scopes own what they create through links (own()).
 import type { ComputedRefImpl as Computed } from './computed.js'
 import type { ReactiveEffect as Effect } from './effect.js'
 import type { EffectScope } from './effectScope.js'
@@ -47,17 +57,25 @@ export interface Link {
 
 export const enum ReactiveFlags {
   None = 0,
-  Mutable = 1 << 0,
-  Watching = 1 << 1,
-  RecursedCheck = 1 << 2,
+  /** A computed: a push passes on through it. */
+  Computed = 1 << 0,
+  /** A watcher (an effect): a push hands it to the notify buffer. */
+  Watcher = 1 << 1,
+  /** A run of the sub is on the stack. */
+  Running = 1 << 2,
+  /** Pushed during its run, or while some effect ran (see mark()). */
   Recursed = 1 << 3,
+  /** Must run: never ran, a dep it read changed, or its last run failed. */
   Dirty = 1 << 4,
+  /** May have to run: some transitive dep changed. */
   Pending = 1 << 5,
+  /** The sub has indexed its deps and that run has not ended. */
+  Indexed = 1 << 6,
   /**
-   * The sub has indexed its deps and that run has not ended.
+   * Disposed during its own run: its links go when the run ends.
    * (Bits 7, 8 and 10 are `EffectFlags`.)
    */
-  Indexed = 1 << 6,
+  Disposed = 1 << 9,
 }
 
 /**
@@ -132,11 +150,9 @@ let notifyIndex = 0
 let notifyBufferLength = 0
 
 export function setActiveSub(sub?: ReactiveNode): ReactiveNode | undefined {
-  try {
-    return activeSub
-  } finally {
-    activeSub = sub
-  }
+  const prevSub = activeSub
+  activeSub = sub
+  return prevSub
 }
 
 export function startBatch(): void {
@@ -256,12 +272,23 @@ function unsubscribed(dep: ReactiveNode, sub: ReactiveNode): boolean {
   return true
 }
 
-/** A new link at the cursor, as the newest subscriber of `dep`. */
+/** A new link of a run at the cursor, as the newest subscriber of `dep`. */
 function insertLink(
   dep: ReactiveNode,
   sub: ReactiveNode,
   cursor: Link | undefined,
   next: Link | undefined,
+): void {
+  addLink(dep, sub, cursor, next, dep.version!, (sub.gen! + 1) & VERSION_MASK)
+}
+
+function addLink(
+  dep: ReactiveNode,
+  sub: ReactiveNode,
+  cursor: Link | undefined,
+  next: Link | undefined,
+  version: number,
+  gen: number,
 ): void {
   if (__TEST__) stats.links++
   const prevSub = dep.subsTail
@@ -269,9 +296,8 @@ function insertLink(
     (sub.depsTail =
     dep.subsTail =
       {
-        // 0 for a link of an effect scope to what it owns
-        version: dep.version! | 0,
-        gen: (sub.gen! + 1) & VERSION_MASK,
+        version,
+        gen,
         dep,
         sub,
         prevDep: cursor,
@@ -346,7 +372,8 @@ export function own(node: ReactiveNode, scope: ReactiveNode): void {
   if (prevSub !== undefined && prevSub.sub === scope) {
     return
   }
-  insertLink(node, scope, tail, undefined)
+  // no run reads it: no version, no generation
+  addLink(node, scope, tail, undefined, 0, 0)
 }
 
 // ------------------------------------------------------------------ index
@@ -486,9 +513,17 @@ function cut(sub: ReactiveNode, last: Link | undefined): void {
   }
 }
 
-/** Removes every link of `sub`. */
-export function unlinkDeps(sub: ReactiveNode): void {
+/**
+ * `sub` is gone for good: its links go, now or, during its own run, when the
+ * run ends.
+ */
+export function dispose(sub: ReactiveNode): void {
+  if (sub.flags & ReactiveFlags.Running) {
+    sub.flags |= ReactiveFlags.Disposed
+    return
+  }
   cut(sub, undefined)
+  sub.flags &= ~(ReactiveFlags.Dirty | ReactiveFlags.Pending)
 }
 
 /** Removes `link` from its dep's subscribers; a dep left with none is an orphan. */
@@ -524,7 +559,7 @@ function releaseOrphans(base: number): void {
     if (
       dep.subs === undefined &&
       dep.deps !== undefined &&
-      !(dep.flags & ReactiveFlags.RecursedCheck)
+      !(dep.flags & ReactiveFlags.Running)
     ) {
       let link: Link | undefined = dep.deps
       dep.deps = dep.depsTail = undefined
@@ -564,7 +599,7 @@ export function invalidate(dep: ReactiveNode): void {
 function push(dep: ReactiveNode, changed: boolean): void {
   for (let link = dep.subs; link !== undefined; link = link.nextSub) {
     const sub = link.sub
-    const running = sub.flags & ReactiveFlags.RecursedCheck
+    const running = sub.flags & ReactiveFlags.Running
     const flags = mark(link, sub)
     // A sub that read the old version must run. So must a running one that
     // has read it (it is Pending then), even if it reads it again: in Vue a
@@ -573,7 +608,7 @@ function push(dep: ReactiveNode, changed: boolean): void {
     if (changed && (!running || sub.flags & ReactiveFlags.Pending)) {
       sub.flags |= ReactiveFlags.Dirty
     }
-    if (flags & ReactiveFlags.Mutable && sub.subs !== undefined) {
+    if (flags & ReactiveFlags.Computed && sub.subs !== undefined) {
       markDeep(sub.subs)
     }
   }
@@ -618,7 +653,7 @@ function markDeep(first: Link): void {
   for (;;) {
     while (link !== undefined) {
       const sub: ReactiveNode = link.sub
-      if (mark(link, sub) & ReactiveFlags.Mutable) {
+      if (mark(link, sub) & ReactiveFlags.Computed) {
         const subs = sub.subs
         if (subs !== undefined) {
           if (link.nextSub !== undefined) {
@@ -644,11 +679,11 @@ function markDeep(first: Link): void {
 function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
   if (__TEST__) stats.marks++
   const flags = sub.flags
-  if (!(flags & (ReactiveFlags.Mutable | ReactiveFlags.Watching))) {
+  if (!(flags & (ReactiveFlags.Computed | ReactiveFlags.Watcher))) {
     // an effect scope owning a computed
     return ReactiveFlags.None
   }
-  if (flags & ReactiveFlags.RecursedCheck) {
+  if (flags & ReactiveFlags.Running) {
     // Running: a push through a link this run has not read yet changes
     // nothing, the run reads the new state. Through one it has read, the
     // sub is Pending and Recursed: a watcher is not notified in its own run
@@ -660,7 +695,7 @@ function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
       return ReactiveFlags.None
     }
     sub.flags = flags | ReactiveFlags.Pending | ReactiveFlags.Recursed
-    return flags & ReactiveFlags.Mutable
+    return flags & ReactiveFlags.Computed
   }
   if (!(flags & ReactiveFlags.Pending)) {
     // Pushed while some effect runs: a push may still have to pass through
@@ -674,7 +709,7 @@ function mark(link: Link, sub: ReactiveNode): ReactiveFlags {
     // marked already: so is everything below
     return ReactiveFlags.None
   }
-  if (flags & ReactiveFlags.Watching) {
+  if (flags & ReactiveFlags.Watcher) {
     notifyBuffer[notifyBufferLength++] = sub as Effect
   }
   return flags
@@ -692,7 +727,7 @@ export function startTracking(sub: ReactiveNode): ReactiveNode | undefined {
   sub.flags =
     (sub.flags &
       ~(ReactiveFlags.Recursed | ReactiveFlags.Dirty | ReactiveFlags.Pending)) |
-    ReactiveFlags.RecursedCheck
+    ReactiveFlags.Running
   return setActiveSub(sub)
 }
 
@@ -718,14 +753,24 @@ export function endTracking(
   if (sub.flags & ReactiveFlags.Indexed && indexSub === sub) {
     unindexDeps(sub)
   }
+  if (sub.flags & ReactiveFlags.Disposed) {
+    cut(sub, undefined)
+    sub.flags &= ~(
+      ReactiveFlags.Running |
+      ReactiveFlags.Disposed |
+      ReactiveFlags.Dirty |
+      ReactiveFlags.Pending
+    )
+    return
+  }
   const cursor = sub.depsTail
   if (!failed) {
     cut(sub, cursor)
     sub.gen = (sub.gen! + 1) & VERSION_MASK
-    sub.flags &= ~ReactiveFlags.RecursedCheck
+    sub.flags &= ~ReactiveFlags.Running
     return
   }
-  owe(sub, (sub.flags & ~ReactiveFlags.RecursedCheck) | ReactiveFlags.Dirty)
+  owe(sub, (sub.flags & ~ReactiveFlags.Running) | ReactiveFlags.Dirty)
   const tentative = (sub.gen! + 1) & VERSION_MASK
   const base = orphans.length
   let link = cursor !== undefined ? cursor.nextDep : sub.deps

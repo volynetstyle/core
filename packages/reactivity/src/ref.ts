@@ -129,7 +129,7 @@ class RefImpl<T = any> implements ReactiveNode {
   subsTail: Link | undefined = undefined
   version = 0
   indexLink: Link | undefined = undefined
-  flags: _ReactiveFlags = _ReactiveFlags.Mutable
+  flags: _ReactiveFlags = _ReactiveFlags.None
 
   _value: T
   _wrap?: <T>(v: T) => T
