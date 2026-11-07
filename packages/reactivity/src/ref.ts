@@ -160,8 +160,8 @@ class RefImpl<T = any> implements ReactiveNode {
 
   get value(): T {
     // settle first: the read records the version of the value it returns
-    if (this.flags & _ReactiveFlags.Dirty) {
-      this.update()
+    if (this.flags & _ReactiveFlags.Dirty && this.update()) {
+      settled(this)
     }
     trackRef(this)
     return this._value
@@ -205,7 +205,6 @@ class RefImpl<T = any> implements ReactiveNode {
     this.flags &= ~_ReactiveFlags.Dirty
     if (hasChanged(this._oldValue, (this._oldValue = this._rawValue))) {
       this.version = nextVersion(this.version)
-      settled(this)
       return true
     }
     return false

@@ -265,6 +265,7 @@ function unsubscribed(dep: ReactiveNode, sub: ReactiveNode): boolean {
   if (__TEST__) stats.lookups++
   let budget = SCAN_BUDGET
   for (let link = dep.subs; link !== undefined; link = link.nextSub) {
+    if (__TEST__) stats.subScans++
     if (link.sub === sub || !--budget) {
       return false
     }
@@ -393,6 +394,7 @@ function indexDeps(sub: ReactiveNode, next: Link | undefined): void {
   indexBase = indexTop
   let unread = false
   for (let link = sub.deps; link !== undefined; link = link.nextDep) {
+    if (__TEST__) stats.indexWalk++
     if (link === next) {
       unread = true
     }
@@ -420,6 +422,7 @@ function claimLink(dep: ReactiveNode, link: Link): void {
  */
 function unindexDeps(sub: ReactiveNode): void {
   for (let link = sub.deps; link !== undefined; link = link.nextDep) {
+    if (__TEST__) stats.indexWalk++
     const dep: ReactiveNode = link.dep
     if (dep.indexLink === link) {
       dep.indexLink = undefined
@@ -618,10 +621,13 @@ function push(dep: ReactiveNode, changed: boolean): void {
  * `dep` (a ref, a computed) settled as changed: the subs a push left Pending
  * through it must run. They would find out by versions; marked, a check
  * stops at once instead of bringing up to date the deps they read before.
- * A running sub among them runs once more, as after propagate().
+ * A running sub among them runs once more, as after propagate(). Called by
+ * a reader that brought `dep` up to date, and by a check when `dep` has subs
+ * besides the one it came from.
  */
 export function settled(dep: ReactiveNode): void {
   for (let link = dep.subs; link !== undefined; link = link.nextSub) {
+    if (__TEST__) stats.settles++
     const sub = link.sub
     const flags = sub.flags
     if (
@@ -636,6 +642,7 @@ export function settled(dep: ReactiveNode): void {
 /** Whether the running `sub` has read `link` in this run: at or before the cursor. */
 function isRead(link: Link, sub: ReactiveNode): boolean {
   for (let l = sub.depsTail; l !== undefined; l = l.prevDep) {
+    if (__TEST__) stats.readWalk++
     if (l === link) {
       return true
     }
@@ -883,7 +890,9 @@ function checkFrom(root: ReactiveNode, base: number): boolean {
           continue
         }
         // a computed runs, a ref compares its value
-        dep.update!()
+        if (dep.update!()) {
+          settleOthers(dep)
+        }
       }
       if (dep.version !== link.version) {
         break
@@ -894,7 +903,9 @@ function checkFrom(root: ReactiveNode, base: number): boolean {
       if (node === root) {
         return true
       }
-      node.update!()
+      if (node.update!()) {
+        settleOthers(node)
+      }
     } else if (node === root) {
       return false
     }
@@ -909,7 +920,17 @@ function checkFrom(root: ReactiveNode, base: number): boolean {
       if (node === root) {
         return true
       }
-      node.update!()
+      if (node.update!()) {
+        settleOthers(node)
+      }
     }
+  }
+}
+
+/** settled() for a check: the sub it came from compares versions itself. */
+function settleOthers(dep: ReactiveNode): void {
+  const subs = dep.subs
+  if (subs !== undefined && subs.nextSub !== undefined) {
+    settled(dep)
   }
 }

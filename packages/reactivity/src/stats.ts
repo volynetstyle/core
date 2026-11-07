@@ -31,6 +31,14 @@ export const stats: {
   checks: number
   /** Runs started (effects and computeds). */
   runs: number
+  /** Subscribers visited by searches through a dep. */
+  subScans: number
+  /** Links walked to index the deps of a run, or to end the index. */
+  indexWalk: number
+  /** Links walked to tell whether a running sub has read a link. */
+  readWalk: number
+  /** Subscribers visited when a dep settles as changed. */
+  settles: number
 } = {
   reads: 0,
   hits: 0,
@@ -46,6 +54,10 @@ export const stats: {
   marks: 0,
   checks: 0,
   runs: 0,
+  subScans: 0,
+  indexWalk: 0,
+  readWalk: 0,
+  settles: 0,
 }
 
 export function resetStats(): void {

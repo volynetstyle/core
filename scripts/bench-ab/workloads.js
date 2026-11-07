@@ -247,4 +247,231 @@ export const workloads = {
       }
     },
   },
+  'fan-in.computed-1000': {
+    note: 'one computed reads 1000 refs; each step writes one of them',
+    setup(r) {
+      const sources = range(1000).map(i => r.ref(i))
+      const c = r.computed(() => {
+        let sum = 0
+        for (let i = 0; i < 1000; i++) sum += sources[i].value
+        return sum
+      })
+      let out = 0
+      r.effect(() => {
+        out = c.value
+      })
+      let i = 0
+      return () => {
+        sources[(i * 7919) % 1000].value = ++i
+        return out
+      }
+    },
+  },
+  'fan-in.check-1000': {
+    note: 'an effect reads 1000 computeds of one ref each; one of them changes',
+    setup(r) {
+      const sources = range(1000).map(i => r.ref(i))
+      const cs = sources.map(s => r.computed(() => s.value & 1))
+      let out = 0
+      r.effect(() => {
+        let sum = 0
+        for (let i = 0; i < 1000; i++) sum += cs[i].value
+        out = sum
+      })
+      let i = 0
+      return () => {
+        // half the writes keep the parity: the check finds nothing
+        sources[(i * 7919) % 1000].value += 1 + (i++ & 1)
+        return out
+      }
+    },
+  },
+  'failure.recover': {
+    // The oracle serves stale values after a failure where this kernel runs
+    // again: the builds do different work, the step returns no checksum.
+    note: 'a computed throws every other step; an effect catches and recovers',
+    setup(r) {
+      const s = r.ref(0)
+      const c = r.computed(() => {
+        if (s.value & 1) throw new Error('odd')
+        return s.value
+      })
+      let out = 0
+      r.effect(() => {
+        try {
+          out = c.value
+        } catch {
+          out = -1
+        }
+      })
+      let i = 0
+      return () => {
+        try {
+          s.value = ++i
+        } catch {}
+        return 0
+      }
+    },
+  },
+  'failure.check-throws': {
+    // no checksum, as failure.recover
+    note: 'the check of a watcher throws every other step (caught at the write)',
+    setup(r) {
+      const s = r.ref(0)
+      const deps = range(16).map(i => r.ref(i))
+      const c = r.computed(() => {
+        let sum = 0
+        for (const d of deps) sum += d.value
+        if (s.value % 2) throw new Error('odd')
+        return sum + s.value
+      })
+      let out = 0
+      r.effect(() => {
+        out = c.value
+      })
+      let i = 0
+      return () => {
+        try {
+          s.value = ++i
+        } catch {
+          out = -1
+        }
+        return out & 0
+      }
+    },
+  },
+  'real.todos-1000': {
+    note: 'a reactive list of 1000 todos, filters, a count and 100 row effects',
+    setup(r) {
+      const todos = r.reactive(
+        range(1000).map(i => ({ id: i, text: 't' + i, done: i % 3 === 0 })),
+      )
+      const filter = r.ref('all')
+      const visible = r.computed(() =>
+        filter.value === 'all'
+          ? todos
+          : todos.filter(t => t.done === (filter.value === 'done')),
+      )
+      const left = r.computed(() => todos.filter(t => !t.done).length)
+      let out = 0
+      r.effect(() => {
+        out = left.value
+      })
+      for (let k = 0; k < 100; k++) {
+        r.effect(() => {
+          const t = visible.value[k]
+          out = (out + (t ? (t.done ? 1 : 0) + t.text.length : 0)) | 0
+        })
+      }
+      let i = 0
+      return () => {
+        i++
+        const t = todos[(i * 31) % todos.length]
+        t.done = !t.done
+        if (i % 50 === 0) filter.value = ['all', 'done', 'active'][(i / 50) % 3]
+        return out
+      }
+    },
+  },
+  'real.components-200': {
+    note: '200 components (scopes) on a store; updates, one remount per step',
+    setup(r) {
+      const store = r.reactive({
+        user: { name: 'a', age: 1 },
+        items: range(50).map(i => ({ id: i, price: i })),
+        theme: 'light',
+      })
+      let out = 0
+      /** @param {number} k */
+      const mount = k => {
+        const scope = r.effectScope()
+        scope.run(() => {
+          const item = r.computed(() => store.items[k % 50])
+          const label = r.computed(
+            () => `${store.user.name}:${item.value.price}:${store.theme}`,
+          )
+          r.effect(() => {
+            out = (out + label.value.length) | 0
+          })
+          r.watch(
+            () => item.value.price,
+            v => {
+              out = (out + v) | 0
+            },
+          )
+        })
+        return scope
+      }
+      const scopes = range(200).map(mount)
+      let i = 0
+      return () => {
+        i++
+        store.items[i % 50].price = i
+        if (i % 7 === 0) store.user.name = 'n' + (i & 15)
+        if (i % 97 === 0) store.theme = i & 1 ? 'dark' : 'light'
+        const k = (i * 13) % 200
+        scopes[k].stop()
+        scopes[k] = mount(k)
+        return out
+      }
+    },
+  },
+  'real.deep-watch': {
+    note: 'a deep watcher over a nested object of 300 leaves; one leaf per step',
+    setup(r) {
+      const state = r.reactive({
+        groups: range(30).map(g => ({
+          name: 'g' + g,
+          rows: range(10).map(k => ({ v: g * 10 + k })),
+        })),
+      })
+      let out = 0
+      r.watch(
+        state,
+        () => {
+          out++
+        },
+        { deep: true },
+      )
+      let i = 0
+      return () => {
+        i++
+        state.groups[i % 30].rows[(i * 7) % 10].v = i
+        return out
+      }
+    },
+  },
+  'real.keyed-list-500': {
+    note: 'effects over a keyed list of 500 rows; swaps rows and edits labels',
+    setup(r) {
+      const rows = r.reactive(range(500).map(i => ({ id: i, label: 'r' + i })))
+      const selected = r.ref(-1)
+      let out = 0
+      // a list effect reading every row, and a row effect per visible row
+      r.effect(() => {
+        let sum = 0
+        for (const row of rows) sum += row.id
+        out = sum
+      })
+      for (let k = 0; k < 50; k++) {
+        r.effect(() => {
+          const row = rows[k]
+          out =
+            (out + row.label.length + (selected.value === row.id ? 1 : 0)) | 0
+        })
+      }
+      let i = 0
+      return () => {
+        i++
+        const a = (i * 17) % 500
+        const b = (i * 29) % 500
+        const tmp = rows[a]
+        rows[a] = rows[b]
+        rows[b] = tmp
+        rows[i % 500].label = 'x' + i
+        selected.value = i % 50
+        return out
+      }
+    },
+  },
 }

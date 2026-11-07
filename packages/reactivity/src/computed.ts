@@ -123,8 +123,8 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       (SystemReactiveFlags.Dirty | SystemReactiveFlags.Pending)
     ) {
       try {
-        if (checkDirty(this)) {
-          this.update()
+        if (checkDirty(this) && this.update()) {
+          settled(this)
         }
       } catch (error) {
         // the reader depends on this computed still
@@ -167,7 +167,6 @@ export class ComputedRefImpl<T = any> implements ReactiveNode {
       if (hasChanged(oldValue, newValue)) {
         this._value = newValue
         this.version = nextVersion(this.version)
-        settled(this)
         return true
       }
       return false
